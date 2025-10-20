@@ -814,76 +814,6 @@ router.post("/remove-fcm-token", async (req: Request, res: Response) => {
   }
 });
 
-router.get("/provider/overview", async (req: Request, res: Response) => {
-  try {
-    const businessId = (req.header("x-business-id") || req.query.businessId) as string | undefined;
-    const tz = (req.query.tz as string) || "Asia/Manila";
-
-    if (!businessId) {
-      return res.status(400).json({ message: "Missing businessId (provide as header x-business-id or ?businessId=...)" });
-    }
-
-    if (!mongoose.isValidObjectId(businessId)) {
-      return res.status(400).json({ message: "Invalid businessId." });
-    }
-
-    const nowInTz = DateTime.now().setZone(tz);
-    if (!nowInTz.isValid) {
-      return res.status(400).json({ message: `Invalid timezone '${tz}'. Use an IANA timezone like 'Asia/Manila'.` });
-    }
-
-    const startOfDay = nowInTz.startOf("day").toJSDate();
-    const endOfDay = nowInTz.plus({ days: 1 }).startOf("day").toJSDate();
-
-    const businessObjId = new mongoose.Types.ObjectId(businessId);
-
-    // Run both DB queries in parallel for speed
-    const [bookings, servicesCount] = await Promise.all([
-      Booking.find({
-        businessId: businessObjId,
-        scheduledAt: { $gte: startOfDay, $lt: endOfDay },
-      })
-        .sort({ scheduledAt: 1 })
-        .lean()
-        .exec(),
-      ServiceOffered.countDocuments({ businessId: businessObjId }).exec(),
-    ]);
-
-    // Format scheduledAt for each booking
-    const bookingsWithFormatted = (bookings ?? []).map((b) => {
-      const dt = DateTime.fromJSDate(new Date(b.scheduledAt)).setZone(tz);
-      const formattedDate = dt.toLocaleString({
-        month: "long",
-        day: "numeric",
-        year: "numeric",
-      }) + " at " + dt.toLocaleString({
-        hour: "numeric",
-        minute: "2-digit",
-        hour12: true,
-      });
-
-      // keep original scheduledAt ISO too for parsing client-side
-      return { ...b, scheduledAtFormatted: formattedDate, scheduledAtISO: new Date(b.scheduledAt).toISOString() };
-    });
-
-    return res.status(200).json({
-      message: "Overview",
-      timezone: tz,
-      date: nowInTz.toISODate(),
-      bookingsToday: {
-        count: bookingsWithFormatted.length,
-        bookings: bookingsWithFormatted,
-      },
-      servicesCount,
-    });
-  } catch (err) {
-    console.error("GET /provider/overview error:", err);
-    return res.status(500).json({ message: "Server error", error: (err as Error).message });
-  }
-});
-
-//Wala to below
-
 router.get("/bookings/today", async (req: Request, res: Response) => {
   try {
     const businessId = (req.header("x-business-id") || req.query.businessId) as string | undefined;
@@ -897,8 +827,7 @@ router.get("/bookings/today", async (req: Request, res: Response) => {
       return res.status(400).json({ message: "Invalid businessId." });
     }
 
-    // Determine start/end of "today" in the requested timezone using luxon
-    // Start: 00:00:00.000 inclusive, End: next day 00:00:00.000 exclusive
+    // Determine start/end of "today" in the requested timezone (for filtering)
     const nowInTz = DateTime.now().setZone(tz);
     if (!nowInTz.isValid) {
       return res.status(400).json({ message: `Invalid timezone '${tz}'. Use an IANA timezone like 'Asia/Manila'.` });
@@ -907,7 +836,7 @@ router.get("/bookings/today", async (req: Request, res: Response) => {
     const startOfDay = nowInTz.startOf("day").toJSDate();
     const endOfDay = nowInTz.plus({ days: 1 }).startOf("day").toJSDate();
 
-    // Query bookings where scheduledAt is within [startOfDay, endOfDay)
+    // Query bookings within [startOfDay, endOfDay)
     const bookings = await Booking.find({
       businessId: new mongoose.Types.ObjectId(businessId),
       scheduledAt: { $gte: startOfDay, $lt: endOfDay },
@@ -916,32 +845,43 @@ router.get("/bookings/today", async (req: Request, res: Response) => {
       .lean()
       .exec();
 
-    // Add formatted scheduledAt string for convenience
+    // 🧭 Format scheduledAt as stored (no timezone conversion)
     const bookingsWithFormatted = bookings.map((b) => {
-      const dt = DateTime.fromJSDate(new Date(b.scheduledAt)).setZone(tz);
-      const formatted = dt.toLocaleString({
-        month: "long",
-        day: "numeric",
-        year: "numeric",
-      }) + " at " + dt.toLocaleString({
-        hour: "numeric",
-        minute: "2-digit",
-        hour12: true,
-      });
+      // interpret the raw date as-is, in UTC (no .setZone)
+      const dt = DateTime.fromJSDate(new Date(b.scheduledAt)).toUTC();
+      const formatted =
+        dt.toLocaleString({
+          month: "long",
+          day: "numeric",
+          year: "numeric",
+        }) +
+        " at " +
+        dt.toLocaleString({
+          hour: "numeric",
+          minute: "2-digit",
+          hour12: true,
+        }) +
+        " UTC";
 
-      return { ...b, scheduledAtFormatted: formatted };
+      return {
+        ...b,
+        scheduledAtFormatted: formatted,
+      };
     });
 
     return res.status(200).json({
       message: "Bookings for today",
-      timezone: tz,
-      date: nowInTz.toISODate(), // e.g. "2025-12-20"
+      timezone: "UTC", // clarify that formatting is in UTC
+      date: nowInTz.toISODate(),
       count: bookingsWithFormatted.length,
       bookings: bookingsWithFormatted,
     });
   } catch (err) {
     console.error("GET /bookings/today error:", err);
-    return res.status(500).json({ message: "Server error", error: (err as Error).message });
+    return res.status(500).json({
+      message: "Server error",
+      error: (err as Error).message,
+    });
   }
 });
 
