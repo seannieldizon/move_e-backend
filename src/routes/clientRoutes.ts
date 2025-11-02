@@ -12,6 +12,10 @@ import { DateTime } from "luxon";
 
 const router = Router();
 
+router.get("/", (req, res) => {
+  res.status(200).send("✅ Move-E Backend is running!");
+});
+
 router.post("/signup", async (req: Request, res: Response) => {
   try {
     const {
