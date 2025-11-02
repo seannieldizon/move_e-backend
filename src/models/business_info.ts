@@ -1,5 +1,16 @@
 import mongoose, { Schema, Document } from "mongoose";
 
+/**
+ * BusinessInfo model (updated)
+ *
+ * Changes:
+ * - validId is now a sub-document { front, back } to store both front/back ID file paths or URLs.
+ * - pre("validate") updated to require either businessPermit OR both validId.front & validId.back.
+ * - kept existing fields & behavior otherwise.
+ */
+
+/* ----------------------------- Sub-interfaces ---------------------------- */
+
 export interface IDaySchedule {
   open?: string | null; // "HH:mm"
   close?: string | null; // "HH:mm"
@@ -15,6 +26,13 @@ export interface ILocationSubdoc {
   note?: string;
 }
 
+export interface IValidIdSubdoc {
+  front?: string | null; // filepath or URL
+  back?: string | null; // filepath or URL
+}
+
+/* ----------------------------- Enums / Types ----------------------------- */
+
 export type BusinessCategory =
   | "Hair & Makeup"
   | "Photoshoot"
@@ -27,6 +45,8 @@ export type BusinessCategory =
   | "Salon"
   | "Barbershop";
 
+/* ----------------------------- Main interface ---------------------------- */
+
 export interface IBusinessInfo extends Document {
   clientId: mongoose.Types.ObjectId;
   businessName: string;
@@ -34,17 +54,19 @@ export interface IBusinessInfo extends Document {
   email?: string;
   logo?: string;
   businessPermit?: string;
-  validId?: string;
+  validId?: IValidIdSubdoc;
   location?: ILocationSubdoc;
   operatingSchedule: {
     [day: string]: IDaySchedule;
   };
-  fcmTokens?: string[]; // <-- added
+  fcmTokens?: string[]; // device tokens
   category?: BusinessCategory;
   accountStatus: "for_verification" | "verified" | "rejected";
   createdAt?: Date;
   updatedAt?: Date;
 }
+
+/* ----------------------------- Sub-schemas ------------------------------- */
 
 const DayScheduleSchema = new Schema<IDaySchedule>(
   {
@@ -67,7 +89,16 @@ const LocationSubSchema = new Schema<ILocationSubdoc>(
   { _id: false }
 );
 
-// allowed categories (kept in code for reuse)
+const ValidIdSubSchema = new Schema<IValidIdSubdoc>(
+  {
+    front: { type: String, default: null },
+    back: { type: String, default: null },
+  },
+  { _id: false }
+);
+
+/* ----------------------------- Constants -------------------------------- */
+
 const BUSINESS_CATEGORIES: BusinessCategory[] = [
   "Hair & Makeup",
   "Photoshoot",
@@ -80,6 +111,8 @@ const BUSINESS_CATEGORIES: BusinessCategory[] = [
   "Salon",
   "Barbershop",
 ];
+
+/* ----------------------------- Main schema ------------------------------- */
 
 const businessInfoSchema = new Schema<IBusinessInfo>(
   {
@@ -94,8 +127,12 @@ const businessInfoSchema = new Schema<IBusinessInfo>(
     email: { type: String, trim: true, lowercase: true, sparse: true },
     logo: { type: String },
     businessPermit: { type: String },
-    validId: { type: String },
+
+    // validId is now a sub-document holding front/back image paths or URLs
+    validId: { type: ValidIdSubSchema },
+
     location: { type: LocationSubSchema },
+
     operatingSchedule: {
       type: Map,
       of: DayScheduleSchema,
@@ -123,7 +160,7 @@ const businessInfoSchema = new Schema<IBusinessInfo>(
       required: false,
     },
 
-    // ✅ Added accountStatus
+    // accountStatus
     accountStatus: {
       type: String,
       enum: ["for_verification", "verified", "rejected"],
@@ -133,20 +170,40 @@ const businessInfoSchema = new Schema<IBusinessInfo>(
   { timestamps: true }
 );
 
-// Validation: require at least one of contactNumber or email
+/* ----------------------------- Validation --------------------------------
+   Require either contactNumber or email; require either businessPermit OR
+   BOTH validId.front & validId.back (you can relax this to require any side
+   by changing the check below).
+--------------------------------------------------------------------------- */
+
 businessInfoSchema.pre("validate", function (next) {
-  const doc = this as IBusinessInfo;
+  const doc = this as IBusinessInfo & { validId?: IValidIdSubdoc };
+
+  // require contact info
   if (!doc.contactNumber && !doc.email) {
     return next(new Error("Either contactNumber or email is required for a business."));
   }
-  // require at least one identity doc / permit
-  if (!doc.businessPermit && !doc.validId) {
-    return next(new Error("Either businessPermit or validId is required for a business."));
+
+  const hasPermit = !!doc.businessPermit;
+  const hasValidIdFront = !!(doc.validId && doc.validId.front);
+  // const hasValidIdBoth = !!(doc.validId && doc.validId.front && doc.validId.back);
+
+  // Accept: businessPermit OR at least a front valid ID
+  if (!hasPermit && !hasValidIdFront) {
+    return next(
+      new Error(
+        "Either businessPermit or a valid ID (front image) is required for a business."
+      )
+    );
   }
+
   next();
 });
 
-// Convenience static helpers for tokens (optional but handy)
+
+/* ----------------------------- Statics / Methods -------------------------- */
+
+// Convenience static helper for tokens (optional but handy)
 businessInfoSchema.statics.findByClient = function (clientId: mongoose.Types.ObjectId | string) {
   return this.find({ clientId }).sort({ createdAt: -1 }).exec();
 };
@@ -171,6 +228,8 @@ businessInfoSchema.methods = {
     await this.save();
   },
 };
+
+/* ----------------------------- Exports ----------------------------------- */
 
 export { BUSINESS_CATEGORIES };
 

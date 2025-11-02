@@ -8,6 +8,7 @@ import Booking from "../models/booking";
 import ServiceOffered from "../models/services_offered";
 import dotenv from "dotenv";
 import { DateTime } from "luxon";
+import fs from "fs/promises";
 
 const router = Router();
 dotenv.config();
@@ -22,6 +23,26 @@ const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 10 * 1024 * 1024 },
 });
+
+function uploadStreamToCloudinary(readable: NodeJS.ReadableStream, options: any = {}) {
+  return new Promise<any>((resolve, reject) => {
+    const uploadStream = cloudinary.uploader.upload_stream(options, (error: any, result: any) => {
+      if (error) return reject(error);
+      resolve(result);
+    });
+    readable.pipe(uploadStream);
+  });
+}
+
+// Helper: convert readable stream to buffer (fallback)
+async function streamToBuffer(readable: NodeJS.ReadableStream): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  return new Promise<Buffer>((resolve, reject) => {
+    readable.on("data", (chunk) => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
+    readable.on("end", () => resolve(Buffer.concat(chunks)));
+    readable.on("error", (err) => reject(err));
+  });
+}
 
 function uploadBufferToCloudinary(buffer: Buffer, options: any = {}) {
   return new Promise<any>((resolve, reject) => {
@@ -45,7 +66,10 @@ router.post(
   upload.fields([
     { name: "logo", maxCount: 1 },
     { name: "businessPermit", maxCount: 1 },
+    // Support both the old single 'validId' field AND the new separate fields:
     { name: "validId", maxCount: 1 },
+    { name: "validIdFront", maxCount: 1 },
+    { name: "validIdBack", maxCount: 1 },
   ]),
   async (req: Request, res: Response) => {
     try {
@@ -56,10 +80,12 @@ router.post(
         email,
         logo: logoFromBody,
         businessPermit: businessPermitFromBody,
-        validId: validIdFromBody,
+        validId: validIdFromBody, // legacy single-field support (string or URL)
+        validIdFront: validIdFrontFromBody, // dataURL or URL string (optional)
+        validIdBack: validIdBackFromBody, // dataURL or URL string (optional)
         location,
         operatingSchedule,
-        category, // ✅ Added category
+        category,
       } = req.body;
 
       // Basic validation
@@ -88,7 +114,7 @@ router.post(
       if (contactNumber) doc.contactNumber = String(contactNumber).trim();
       if (email) doc.email = String(email).trim().toLowerCase();
 
-      // ✅ Handle category validation
+      // Category validation (unchanged)
       if (category && typeof category === "string") {
         const allowedCategories = [
           "Hair & Makeup",
@@ -118,13 +144,14 @@ router.post(
         | undefined;
       const cloudFolder = `businesses/${clientId}`;
 
-      // Helper for Cloudinary upload
+      // Helper for Cloudinary upload (generic)
       async function processUploadField(
-        fieldName: "logo" | "businessPermit" | "validId",
-        fileArray?: Express.Multer.File[],
-        dataUrl?: string
+        fieldName: string,
+        fileArray?: Express.Multer.File[] | undefined,
+        dataUrlOrUrl?: string | undefined
       ): Promise<{ url?: string; public_id?: string } | undefined> {
         try {
+          // priority: file buffer (multipart) -> dataUrl (base64) or direct URL string
           if (fileArray && fileArray.length > 0) {
             const file = fileArray[0];
             const result = await uploadBufferToCloudinary(file.buffer, {
@@ -133,22 +160,25 @@ router.post(
             });
             return { url: result.secure_url, public_id: result.public_id };
           } else if (
-            dataUrl &&
-            typeof dataUrl === "string" &&
-            dataUrl.trim().length > 0
+            dataUrlOrUrl &&
+            typeof dataUrlOrUrl === "string" &&
+            dataUrlOrUrl.trim().length > 0
           ) {
+            // If string begins with http(s) assume it's already a URL
             if (
-              dataUrl.startsWith("http://") ||
-              dataUrl.startsWith("https://")
+              dataUrlOrUrl.startsWith("http://") ||
+              dataUrlOrUrl.startsWith("https://")
             ) {
-              return { url: dataUrl };
+              return { url: dataUrlOrUrl };
             }
-            const result = await uploadDataUrlToCloudinary(dataUrl, {
+            // Otherwise treat as data URL (base64)
+            const result = await uploadDataUrlToCloudinary(dataUrlOrUrl, {
               folder: cloudFolder,
               resource_type: "image",
             });
             return { url: result.secure_url, public_id: result.public_id };
           }
+          return undefined;
         } catch (err) {
           throw new Error(
             `Failed to upload ${fieldName}: ${(err as any).message || err}`
@@ -156,22 +186,75 @@ router.post(
         }
       }
 
-      // Upload files (if any)
-      const [logoResult, permitResult, validIdResult] = await Promise.all([
+      // Process uploads in parallel:
+      const [
+        logoResult,
+        permitResult,
+        // legacy single validId (if provided)
+        legacyValidIdResult,
+        // new separate fields
+        validIdFrontResult,
+        validIdBackResult,
+      ] = await Promise.all([
         processUploadField("logo", files?.logo, logoFromBody),
-        processUploadField(
-          "businessPermit",
-          files?.businessPermit,
-          businessPermitFromBody
-        ),
-        processUploadField("validId", files?.validId, validIdFromBody),
+        processUploadField("businessPermit", files?.businessPermit, businessPermitFromBody),
+        processUploadField("validId (legacy)", files?.validId, validIdFromBody),
+        processUploadField("validIdFront", files?.validIdFront, validIdFrontFromBody),
+        processUploadField("validIdBack", files?.validIdBack, validIdBackFromBody),
       ]);
 
+      // Attach single fields if present
       if (logoResult?.url) doc.logo = logoResult.url;
       if (permitResult?.url) doc.businessPermit = permitResult.url;
-      if (validIdResult?.url) doc.validId = validIdResult.url;
 
-      // ✅ Location
+      // Build validId sub-object:
+      // Prefer explicit front/back; fall back to legacy single 'validId' if provided.
+      const validIdObj: { front?: string | null; back?: string | null } = {
+        front: validIdFrontResult?.url ?? null,
+        back: validIdBackResult?.url ?? null,
+      };
+
+      // If both front/back empty and legacy provided, put legacy into front (back remains null)
+      if (!validIdObj.front && !validIdObj.back && legacyValidIdResult?.url) {
+        validIdObj.front = legacyValidIdResult.url;
+      }
+
+      // If the client included legacy validId in body as a plain string URL and we didn't upload it
+      if (!validIdObj.front && !validIdObj.back && typeof validIdFromBody === "string" && validIdFromBody.trim()) {
+        // if it's a URL use it
+        if (validIdFromBody.startsWith("http://") || validIdFromBody.startsWith("https://")) {
+          validIdObj.front = validIdFromBody;
+        }
+      }
+
+      // Only set doc.validId if at least one side exists
+      if (validIdObj.front || validIdObj.back) {
+        doc.validId = validIdObj;
+      }
+
+      // Also allow businessPermit provided via body (if not uploaded)
+      if (businessPermitFromBody && typeof businessPermitFromBody === "string") {
+        // If it's a URL, use it directly; else will be handled above if uploaded
+        if (businessPermitFromBody.startsWith("http://") || businessPermitFromBody.startsWith("https://")) {
+          doc.businessPermit = businessPermitFromBody;
+        }
+      }
+
+      // Server-side validation: require either businessPermit OR at least the front of validId
+      const hasPermit = !!doc.businessPermit;
+      const hasValidIdFront = !!(doc.validId && doc.validId.front);
+
+      if (!hasPermit && !hasValidIdFront) {
+        return res.status(400).json({
+          message:
+            "Either businessPermit or a valid ID (front image) is required for a business.",
+        });
+      }
+
+      // Optional: validate file types / sizes here (recommended)
+      // e.g. if (files?.validIdFront?.[0] && files.validIdFront[0].mimetype !== 'image/jpeg') { ... }
+
+      // ✅ Location parsing (unchanged)
       if (location) {
         let parsedLocation = location;
         if (typeof location === "string") {
@@ -204,7 +287,7 @@ router.post(
         };
       }
 
-      // ✅ Schedule
+      // ✅ Schedule parsing (unchanged)
       if (operatingSchedule) {
         try {
           doc.operatingSchedule =
@@ -236,6 +319,7 @@ router.post(
     }
   }
 );
+
 
 router.get("/get-business/:clientId", async (req: Request, res: Response) => {
   try {
@@ -371,12 +455,19 @@ router.get("/services/by-business/:businessId", async (req: Request, res: Respon
     if (!businessId) return res.status(400).json({ message: "businessId is required in path." });
     if (!mongoose.isValidObjectId(businessId)) return res.status(400).json({ message: "Invalid businessId format." });
 
+    // Try to fetch the business to read its category (if present).
+    // We do NOT return 404 if the business is missing — we simply return category: null
+    // to keep behaviour compatible with the original endpoint's outputs.
+    const business = await BusinessInfo.findById(businessId).lean().exec();
+    const businessCategory = business && typeof business.category !== "undefined" ? business.category : null;
+
     const filter = { businessId: new mongoose.Types.ObjectId(businessId) };
 
     const services = await ServiceOffered.find(filter).sort({ createdAt: -1 }).lean().exec();
     const total = await ServiceOffered.countDocuments(filter).exec();
 
-    return res.status(200).json({ services, total });
+    // NOTE: original fields preserved; added `category` from BusinessInfo
+    return res.status(200).json({ services, total, category: businessCategory });
   } catch (err) {
     console.error("GET /services/by-business/:businessId error:", err);
     if (err instanceof Error) return res.status(500).json({ message: "Server error.", error: err.message });
@@ -437,38 +528,27 @@ router.post(
       if (duration) serviceDoc.duration = String(duration).trim();
       if (description) serviceDoc.description = String(description).trim();
 
-      // Save service first (without image). If you prefer to upload image first and then persist URL,
-      // you can reorder upload/persist. For simplicity we save service, then upload if provided.
-      const service = new ServiceOffered(serviceDoc);
+      // Save service first (without image). We'll update with image URL after upload.
+      let service = new ServiceOffered(serviceDoc);
       await service.save();
 
-      // If an image file (multipart) or data URL is provided, upload to Cloudinary
+      // Upload image (if provided) and then update the saved service with the url/public_id
       let imageResult: { url?: string; public_id?: string } | undefined;
-      const files = req.files as { [fieldname: string]: Express.Multer.File[] } | undefined;
-
-      // Helper cloud folder per business
       const cloudFolder = `services/${businessId}`;
 
       try {
-        // 1) multipart file
-        if (req.file && req.file.buffer && req.file.mimetype && req.file.size > 0) {
+        // Case: multipart uploaded file (multer puts file buffer on req.file)
+        if (req.file && req.file.buffer && req.file.size && req.file.mimetype) {
+          console.log(`Uploading multipart file for service ${service._id}`);
           const uploadRes = await uploadBufferToCloudinary(req.file.buffer, {
-            folder: cloudFolder,
-            resource_type: "image",
-            // optionally add transformation or format
-          });
-          imageResult = { url: uploadRes.secure_url, public_id: uploadRes.public_id };
-        } else if (files && files.image && files.image.length > 0) {
-          const file = files.image[0];
-          const uploadRes = await uploadBufferToCloudinary(file.buffer, {
             folder: cloudFolder,
             resource_type: "image",
           });
           imageResult = { url: uploadRes.secure_url, public_id: uploadRes.public_id };
         } else if (imageData && typeof imageData === "string" && imageData.trim().length > 0) {
-          // 2) in-body imageData: either remote URL or data URL
+          // in-body imageData: could be remote URL or base64 data URL
           if (imageData.startsWith("http://") || imageData.startsWith("https://")) {
-            // remote url — we don't reupload; use as-is
+            // remote url — store as-is (no cloudinary upload)
             imageResult = { url: imageData };
           } else {
             // assume base64 data URL — upload to Cloudinary
@@ -481,20 +561,23 @@ router.post(
         }
       } catch (err) {
         console.warn("Service image upload failed:", err);
-        // we do not fail the whole operation for image upload failure; return service with warning
+        // continue — we don't fail creating service on upload error, but we won't have imageResult
       }
 
-      // OPTIONAL: persist the image URL into the service document if your schema supports it.
-      // If your ServiceOffered schema has a field like: image: { url: String, public_id: String }
-      // then uncomment the lines below to save the image into the document:
-      /*
-      if (imageResult?.url) {
-        service.set('image', { url: imageResult.url, public_id: imageResult.public_id });
+      // If upload succeeded (or remote URL provided), persist into service document (single image)
+      if (imageResult && imageResult.url) {
+        // use imagePath field and optional imagePublicId
+        service.imagePath = imageResult.url;
+        if (imageResult.public_id) service.imagePublicId = imageResult.public_id;
+
+        // if your schema has `images` array and you want to use it instead, do:
+        // service.images = [{ url: imageResult.url, publicId: imageResult.public_id }];
+
+        // Save the update
         await service.save();
       }
-      */
 
-      // Response: return created service and image info if any
+      // Return the saved/updated service
       return res.status(201).json({
         message: "Service created successfully.",
         service,
@@ -509,6 +592,7 @@ router.post(
     }
   }
 );
+
 
 router.get(
   ["/services/by-business/:businessId", "/services"],
@@ -603,19 +687,24 @@ router.put("/service/:id", upload.single("image"), async (req: Request, res: Res
       return res.status(400).json({ message: "Valid service id is required." });
     }
 
+    // DEBUG: log incoming payload (useful while testing)
+    console.log("PUT /service/:id - req.body:", req.body);
+    console.log("PUT /service/:id - req.file present?:", !!req.file, req.file ? { originalname: req.file.originalname, keys: Object.keys(req.file) } : null);
+
     const service = await ServiceOffered.findById(id).exec();
     if (!service) {
       return res.status(404).json({ message: "Service not found." });
     }
 
-    // Optional fields to update
+    // Acceptable fields
     const { title, price: rawPrice, duration, description, imageData, businessId: incomingBusinessId } = req.body as any;
 
-    // If client attempts to change businessId, ensure it matches existing service (prevent reassign)
+    // Prevent reassigning service to another business
     if (incomingBusinessId && String(incomingBusinessId) !== String(service.businessId)) {
       return res.status(403).json({ message: "Cannot change businessId of a service." });
     }
 
+    // Update basic fields if provided
     if (title != null) service.title = String(title).trim();
     if (rawPrice != null) {
       const parsed = typeof rawPrice === "number" ? rawPrice : parseFloat(String(rawPrice).replace(/[,₱\s]/g, ""));
@@ -627,62 +716,126 @@ router.put("/service/:id", upload.single("image"), async (req: Request, res: Res
     if (duration != null) service.duration = String(duration).trim();
     if (description != null) service.description = String(description).trim();
 
-    // Image handling: upload new image if provided; if success delete old Cloudinary resource (if any)
-    let newImageResult: { url?: string; public_id?: string } | undefined;
-
     const cloudFolder = `services/${service.businessId?.toString() || "unknown"}`;
 
+    // -------- explicit delete: client requested deletion and did NOT upload a file ----------
+    if (imageData === "__DELETE__" && !req.file) {
+      const oldAny: any = (service as any).image;
+      const oldPublicId = (oldAny && oldAny.public_id) || (service as any).imagePublicId;
+      if (oldPublicId) {
+        try {
+          await cloudinary.uploader.destroy(oldPublicId, { resource_type: "image" });
+          console.log("Cloudinary: deleted old image", oldPublicId);
+        } catch (err) {
+          console.warn("Failed to delete old Cloudinary image (explicit delete):", err);
+        }
+      }
+      // clear all image-related fields your frontend might read
+      (service as any).image = undefined;
+      (service as any).imageUrl = undefined;
+      (service as any).imagePath = undefined;
+      (service as any).images = [];
+      (service as any).imagePublicId = undefined;
+    }
+
+    // -------- image upload / imageData handling ----------
+    let uploadResult: any = undefined;
+    let tempDiskPath: string | undefined;
+
     try {
-      if (req.file && req.file.buffer && req.file.size > 0) {
-        // upload multipart image
-        const uploaded = await uploadBufferToCloudinary(req.file.buffer, { folder: cloudFolder, resource_type: "image" });
-        newImageResult = { url: uploaded.secure_url, public_id: uploaded.public_id };
-      } else if (imageData && typeof imageData === "string" && imageData.trim().length > 0) {
-        if (imageData.startsWith("http://") || imageData.startsWith("https://")) {
-          // remote url - do not reupload; store as url
-          newImageResult = { url: imageData };
+      if (req.file) {
+        // Common multer memoryStorage shape: req.file.buffer
+        if ((req.file as any).buffer && (req.file as any).buffer.length > 0) {
+          console.log("PUT /service/:id - using req.file.buffer, size:", (req.file as any).buffer.length);
+          const buffer = (req.file as any).buffer as Buffer;
+          uploadResult = await uploadBufferToCloudinary(buffer, { folder: cloudFolder, resource_type: "image" });
+        }
+        // Disk storage: multer provides path
+        else if ((req.file as any).path) {
+          const filePath = (req.file as any).path as string;
+          console.log("PUT /service/:id - using req.file.path:", filePath);
+          tempDiskPath = filePath;
+          const fileBuf = await fs.readFile(filePath);
+          uploadResult = await uploadBufferToCloudinary(fileBuf, { folder: cloudFolder, resource_type: "image" });
+        }
+        // Some setups expose a stream
+        else if ((req.file as any).stream) {
+          console.log("PUT /service/:id - using req.file.stream");
+          const stream = (req.file as any).stream as NodeJS.ReadableStream;
+          // Prefer direct stream upload (memory efficient)
+          try {
+            uploadResult = await uploadStreamToCloudinary(stream, { folder: cloudFolder, resource_type: "image" });
+          } catch (e) {
+            // fallback: convert stream -> buffer and call uploadBufferToCloudinary
+            console.warn("uploadStreamToCloudinary failed, falling back to buffer conversion:", e);
+            const buf = await streamToBuffer(stream);
+            uploadResult = await uploadBufferToCloudinary(buf, { folder: cloudFolder, resource_type: "image" });
+          }
         } else {
-          // data URL (base64) - upload
-          const uploaded = await uploadDataUrlToCloudinary(imageData, { folder: cloudFolder, resource_type: "image" });
-          newImageResult = { url: uploaded.secure_url, public_id: uploaded.public_id };
+          console.warn("PUT /service/:id - req.file present but no buffer/path/stream found; file keys:", Object.keys(req.file));
+        }
+      } else if (imageData && typeof imageData === "string" && imageData.trim().length > 0) {
+        // If caller passed a remote URL or data URL in imageData (and didn't upload a file)
+        if (imageData.startsWith("http://") || imageData.startsWith("https://")) {
+          // do not reupload, just save the URL
+          uploadResult = { secure_url: imageData, url: imageData, public_id: undefined };
+        } else if (imageData.startsWith("data:")) {
+          uploadResult = await uploadDataUrlToCloudinary(imageData, { folder: cloudFolder, resource_type: "image" });
+        } else {
+          console.warn("PUT /service/:id - unrecognized imageData (ignored):", imageData);
         }
       }
     } catch (err) {
       console.warn("Image upload (edit) failed:", err);
-      // don't fail update just because image upload failed; send warning in response
+      // continue — do not abort the entire update just because upload failed
+    } finally {
+      // cleanup any temporary disk file if used
+      if (tempDiskPath) {
+        try {
+          await fs.unlink(tempDiskPath);
+        } catch (err) {
+          console.warn("Failed to delete temporary local upload file:", tempDiskPath, err);
+        }
+      }
     }
 
-    // If we have new image and the service had old image with public_id, delete old resource from Cloudinary
-    if (newImageResult && newImageResult.url) {
-      const oldImage: any = (service as any).image;
-      if (oldImage && oldImage.public_id) {
+    // -------- write uploadResult (if any) into DB fields your front-end expects ----------
+    if (uploadResult) {
+      console.log("Cloudinary upload result:", uploadResult);
+      const imageUrl = uploadResult.secure_url || uploadResult.url || (typeof uploadResult === "string" ? uploadResult : null);
+      const publicId = uploadResult.public_id || uploadResult.publicId || uploadResult.public || undefined;
+
+      // If we are replacing an existing Cloudinary resource, try to delete the old one
+      const oldAny: any = (service as any).image;
+      const oldPublicId = (oldAny && oldAny.public_id) || (service as any).imagePublicId;
+      if (oldPublicId && publicId && oldPublicId !== publicId) {
         try {
-          await cloudinary.uploader.destroy(oldImage.public_id, { resource_type: "image" });
+          await cloudinary.uploader.destroy(oldPublicId, { resource_type: "image" });
         } catch (err) {
-          // log but continue
-          console.warn("Failed to delete old cloudinary image:", err);
+          console.warn("Failed to delete previous cloudinary image:", oldPublicId, err);
         }
       }
 
-      // save new image info into document
-      (service as any).image = { url: newImageResult.url, public_id: newImageResult.public_id };
+      // Save into common fields (imagePath is crucial for your front-end)
+      (service as any).image = publicId ? { url: imageUrl, public_id: publicId } : { url: imageUrl };
+      (service as any).imageUrl = imageUrl;
+      (service as any).imagePublicId = publicId;
+      (service as any).images = [{ url: imageUrl, public_id: publicId }];
+      (service as any).imagePath = imageUrl; // IMPORTANT: front-end expects the path here
     }
 
     await service.save();
 
-    return res.status(200).json({
-      message: "Service updated successfully.",
-      service,
-      image: newImageResult,
-    });
-  } catch (error: any) {
-    console.error("PUT /service/:id error:", error);
-    if (error instanceof Error) {
-      return res.status(500).json({ message: "Server error.", error: error.message });
-    }
+    // Return canonical fresh document
+    const fresh = await ServiceOffered.findById(id).lean().exec();
+    return res.status(200).json({ message: "Service updated successfully.", service: fresh, image: uploadResult || null });
+  } catch (err: any) {
+    console.error("PUT /service/:id error:", err);
+    if (err instanceof Error) return res.status(500).json({ message: "Server error.", error: err.message });
     return res.status(500).json({ message: "Unknown server error." });
   }
 });
+
 
 /**
  * DELETE /service/:id
@@ -860,8 +1013,7 @@ router.get("/bookings/today", async (req: Request, res: Response) => {
           hour: "numeric",
           minute: "2-digit",
           hour12: true,
-        }) +
-        " UTC";
+        });
 
       return {
         ...b,

@@ -1,6 +1,6 @@
 import { Router, Request, Response } from "express";
 import bcrypt from "bcryptjs";
-import User from "../models/client_accounts";
+import User, { IClient } from "../models/client_accounts";
 import Location from "../models/location";
 import mongoose from "mongoose";
 import jwt, { Secret, SignOptions } from "jsonwebtoken";
@@ -8,6 +8,7 @@ import Favorite from "../models/favorite";
 import BusinessInfo from "../models/business_info";
 import ServiceOffered from "../models/services_offered";
 import Booking from "../models/booking";
+import { DateTime } from "luxon";
 
 const router = Router();
 
@@ -61,46 +62,90 @@ router.post("/signup", async (req: Request, res: Response) => {
 
 router.post("/login", async (req: Request, res: Response) => {
   try {
-    const { email, password } = req.body;
+    const { email, password } = (req.body as { email?: string; password?: string }) ?? {};
 
     if (!email || !password) {
-      return res
-        .status(400)
-        .json({ message: "Email/Phone and password are required." });
+      return res.status(400).json({ message: "Email/Phone and password are required." });
     }
 
-    // Determine if it's an email or phone number
-    const isEmail = email.includes("@");
+    const isEmail = typeof email === "string" && email.includes("@");
 
-    // Search user by email OR phone
-    const user = await User.findOne(isEmail ? { email } : { phone: email });
+    // Tell TypeScript the document will match the IClient shape
+    const user = (await User.findOne(isEmail ? { email } : { phone: email })) as
+      | (mongoose.Document<any, any, IClient> & IClient & { _id: any })
+      | null;
 
     if (!user) {
       return res.status(401).json({ message: "Invalid email/phone or password." });
     }
 
-    // Compare password
-    const isPasswordValid = await bcrypt.compare(password, user.password);
+    // verify password (user.password should exist on IClient)
+    const isPasswordValid = await bcrypt.compare(password, (user as any).password);
     if (!isPasswordValid) {
       return res.status(401).json({ message: "Invalid email/phone or password." });
     }
 
-    // Return basic user info
-    res.status(200).json({
+    // Safely convert _id to string
+    let userId = "";
+    try {
+      if (user._id == null) {
+        userId = "";
+      } else if (typeof user._id === "string") {
+        userId = user._id;
+      } else if ((user._id as mongoose.Types.ObjectId).toString) {
+        userId = (user._id as mongoose.Types.ObjectId).toString();
+      } else {
+        userId = String(user._id);
+      }
+    } catch (err) {
+      userId = String((user as any)._id);
+    }
+
+    // Optionally sign a JWT if you want sockets/auth to use it
+    const secret = process.env.JWT_SECRET;
+    let token: string | undefined;
+    if (secret) {
+      const payload = { id: userId, email: user.email, role: "client" };
+      token = jwt.sign(payload, secret, { expiresIn: "7d" });
+    }
+
+    // extract middleName and extensionName with fallbacks for common DB key variants
+    const middleName =
+      (user as any).middleName ??
+      (user as any).middle_name ??
+      (user as any).middlename ??
+      (user as any).middleInitial ??
+      (user as any).middle_initial ??
+      "";
+
+    const extensionName =
+      (user as any).extensionName ??
+      (user as any).extension ??
+      (user as any).suffix ??
+      (user as any).ext ??
+      (user as any).nameExtension ??
+      "";
+
+    // Respond with user info + token (if available)
+    return res.status(200).json({
       message: "Login successful",
       user: {
-        id: user._id,
-        firstName: user.firstName,
-        lastName: user.lastName,
-        email: user.email,
-        phone: user.phone,
+        id: userId,
+        firstName: (user as any).firstName ?? "",
+        middleName: middleName ?? "",
+        lastName: (user as any).lastName ?? "",
+        extensionName: extensionName ?? "",
+        email: user.email ?? "",
+        phone: (user as any).phone ?? "",
       },
+      ...(token ? { token } : {}),
     });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ message: "Server error" });
+    console.error("POST /login error:", err);
+    return res.status(500).json({ message: "Server error" });
   }
 });
+
 
 router.post("/save-location", async (req: Request, res: Response) => {
   try {
@@ -472,6 +517,77 @@ router.get("/get-bookings", async (req: Request, res: Response) => {
   } catch (err: any) {
     console.error("GET /bookings error:", err);
     return res.status(500).json({ message: "Server error.", error: err?.message ?? String(err) });
+  }
+});
+
+router.get("/bookings/today", async (req: Request, res: Response) => {
+  try {
+    // Accept clientId from header, query or body
+    const clientIdRaw = (req.header("x-client-id") || req.query.clientId || (req.body && req.body.clientId)) as string | undefined;
+    const tz = (req.query.tz as string) || "Asia/Manila";
+    const formatMode = (req.query.format as string) || ""; // if "stored" -> format stored instant
+
+    if (!clientIdRaw) {
+      return res.status(400).json({ message: "Missing clientId (provide as header x-client-id, ?clientId=..., or JSON body {clientId})" });
+    }
+
+    if (!mongoose.isValidObjectId(clientIdRaw)) {
+      return res.status(400).json({ message: "Invalid clientId (not a valid ObjectId)." });
+    }
+
+    // Determine start/end of "today" in requested timezone using luxon
+    const nowInTz = DateTime.now().setZone(tz);
+    if (!nowInTz.isValid) {
+      return res.status(400).json({ message: `Invalid timezone '${tz}'. Use an IANA timezone like 'Asia/Manila'.` });
+    }
+
+    const startOfDay = nowInTz.startOf("day").toJSDate(); // inclusive
+    const endOfDay = nowInTz.plus({ days: 1 }).startOf("day").toJSDate(); // exclusive
+
+    // Query bookings where scheduledAt is within [startOfDay, endOfDay)
+    const bookings = await Booking.find({
+      clientId: new mongoose.Types.ObjectId(clientIdRaw),
+      scheduledAt: { $gte: startOfDay, $lt: endOfDay },
+    })
+      .sort({ scheduledAt: 1 })
+      .lean()
+      .exec();
+
+    // Map bookings and add formatted time
+    const bookingsWithFormatted = bookings.map((b) => {
+      // b.scheduledAt is a Date (JS Date / UTC instant)
+      const jsDate = new Date(b.scheduledAt);
+
+      // If caller requested to see the stored instant as-is (no tz conversion), format in UTC
+      if (formatMode === "stored") {
+        const dt = DateTime.fromJSDate(jsDate).toUTC();
+        const formatted =
+          dt.toLocaleString({ month: "long", day: "numeric", year: "numeric" }) +
+          " at " +
+          dt.toLocaleString({ hour: "numeric", minute: "2-digit", hour12: true });
+        return { ...b, scheduledAtFormatted: formatted };
+      }
+
+      // Default: format in the requested timezone (use tz for readability and consistency with "today" filter)
+      const dtTz = DateTime.fromJSDate(jsDate).setZone(tz);
+      const formattedTz =
+        dtTz.toLocaleString({ month: "long", day: "numeric", year: "numeric" }) +
+        " at " +
+        dtTz.toLocaleString({ hour: "numeric", minute: "2-digit", hour12: true });
+      return { ...b, scheduledAtFormatted: formattedTz };
+    });
+
+    return res.status(200).json({
+      message: "Client bookings for today",
+      timezoneRequested: tz,
+      format: formatMode || "tz",
+      date: nowInTz.toISODate(), // e.g. "2025-10-21"
+      count: bookingsWithFormatted.length,
+      bookings: bookingsWithFormatted,
+    });
+  } catch (err) {
+    console.error("GET /client/bookings/today error:", err);
+    return res.status(500).json({ message: "Server error", error: (err as Error).message });
   }
 });
 
