@@ -151,43 +151,168 @@ router.post("/login", async (req: Request, res: Response) => {
 });
 
 
+// POST /api/client/save-location
 router.post("/save-location", async (req: Request, res: Response) => {
   try {
-    const { clientId, address, latitude, longitude, displayName, floor, note } = req.body;
+    // Accept optional 'id' for updating a specific saved location
+    const { id, clientId, address, latitude, longitude, displayName, floor, note, selectedLocation } = req.body as any;
 
+    // Basic validation
     if (!clientId || !address || latitude == null || longitude == null) {
-      return res.status(400).json({ message: "Missing required fields." });
+      return res.status(400).json({ message: "Missing required fields. Required: clientId, address, latitude, longitude." });
     }
 
-    const existingLocation = await Location.findOne({ clientId });
-
-    if (existingLocation) {
-      existingLocation.address = address;
-      existingLocation.latitude = latitude;
-      existingLocation.longitude = longitude;
-      existingLocation.displayName = displayName;
-      existingLocation.floor = floor;
-      existingLocation.note = note;
-      await existingLocation.save();
-      return res.status(200).json({ message: "Location updated successfully." });
+    // Normalize lat/lon to numbers
+    const latNum = typeof latitude === "number" ? latitude : parseFloat(String(latitude));
+    const lonNum = typeof longitude === "number" ? longitude : parseFloat(String(longitude));
+    if (Number.isNaN(latNum) || Number.isNaN(lonNum)) {
+      return res.status(400).json({ message: "Invalid latitude or longitude." });
     }
 
-    // Otherwise, create a new record
+    // Helper: convert clientId to ObjectId if appropriate
+    let storedClientId: any = clientId;
+    if (mongoose.isValidObjectId(clientId)) {
+      storedClientId = new mongoose.Types.ObjectId(clientId);
+    }
+
+    // ---------- UPDATE existing location ----------
+    if (id) {
+      if (!mongoose.isValidObjectId(id)) {
+        return res.status(400).json({ message: "Invalid location id." });
+      }
+
+      const existing = await Location.findById(id).exec();
+      if (!existing) {
+        return res.status(404).json({ message: "Location not found." });
+      }
+
+      // Ensure the document belongs to the provided clientId
+      const existingClientId = existing.clientId ? existing.clientId.toString() : existing.clientId;
+      if (existingClientId && String(existingClientId) !== String(clientId)) {
+        return res.status(403).json({ message: "You are not allowed to modify this location." });
+      }
+
+      existing.address = address;
+      existing.latitude = latNum;
+      existing.longitude = lonNum;
+      if (typeof displayName !== "undefined") existing.displayName = displayName;
+      if (typeof floor !== "undefined") existing.floor = floor;
+      if (typeof note !== "undefined") existing.note = note;
+
+      // If caller explicitly set selectedLocation true, unset others for this client
+      if (selectedLocation === true || selectedLocation === 'true') {
+        // mark all other locations for this client as false
+        await Location.updateMany(
+          { clientId: storedClientId, _id: { $ne: existing._id }, selectedLocation: true },
+          { $set: { selectedLocation: false } }
+        ).exec();
+
+        existing.selectedLocation = true;
+      } else if (typeof selectedLocation !== "undefined") {
+        // explicit boolean false requested
+        existing.selectedLocation = !!selectedLocation;
+      }
+      // If selectedLocation not provided, leave as-is.
+
+      await existing.save();
+
+      return res.status(200).json({
+        message: "Location updated successfully.",
+        location: existing.toObject(),
+      });
+    }
+
+    // ---------- CREATE new location ----------
+    // Before creating: mark any existing selected location(s) for this client as false
+    await Location.updateMany(
+      { clientId: storedClientId, selectedLocation: true },
+      { $set: { selectedLocation: false } }
+    ).exec();
+
+    // Create new location and explicitly set selectedLocation to true by default
     const newLocation = new Location({
-      clientId,
+      clientId: storedClientId,
       address,
-      latitude,
-      longitude,
+      latitude: latNum,
+      longitude: lonNum,
       displayName,
       floor,
       note,
+      selectedLocation: true,
     });
 
     await newLocation.save();
-    res.status(201).json({ message: "Location saved successfully." });
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ message: "Server error." });
+
+    return res.status(201).json({
+      message: "Location saved successfully.",
+      location: newLocation.toObject(),
+    });
+  } catch (error: any) {
+    console.error("POST /save-location error:", error);
+    return res.status(500).json({ message: "Server error.", error: error?.message ?? String(error) });
+  }
+});
+
+router.patch("/:id/select", async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    const { clientId: bodyClientId } = req.body as { clientId?: string };
+
+    if (!id) return res.status(400).json({ success: false, message: "Location id is required in URL." });
+
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return res.status(400).json({ success: false, message: "Invalid location id." });
+    }
+
+    // prefer auth when possible:
+    // const authClientId = (req as any).user?.id;
+    const clientId = bodyClientId;
+    if (!clientId) {
+      return res.status(400).json({ success: false, message: "clientId is required in body (or use auth)." });
+    }
+    if (!mongoose.Types.ObjectId.isValid(clientId)) {
+      return res.status(400).json({ success: false, message: "Invalid clientId." });
+    }
+
+    const storedClientId = new mongoose.Types.ObjectId(clientId);
+
+    // Verify ownership
+    const target = await Location.findById(id).exec();
+    if (!target) return res.status(404).json({ success: false, message: "Location not found." });
+    if (String(target.clientId) !== String(clientId)) {
+      return res.status(403).json({ success: false, message: "You are not allowed to select this location." });
+    }
+
+    // use transaction where available
+    const session = await mongoose.startSession();
+    let updatedLocation: any = null;
+    try {
+      await session.withTransaction(async () => {
+        await Location.updateMany(
+          { clientId: storedClientId, _id: { $ne: target._id }, selectedLocation: true },
+          { $set: { selectedLocation: false } },
+          { session }
+        ).exec();
+
+        await Location.updateOne({ _id: target._id }, { $set: { selectedLocation: true } }, { session }).exec();
+
+        updatedLocation = await Location.findById(target._id).session(session).lean().exec();
+      });
+    } finally {
+      session.endSession();
+    }
+
+    // fallback if transaction didn't run
+    if (!updatedLocation) {
+      await Location.updateMany({ clientId: storedClientId, selectedLocation: true }, { $set: { selectedLocation: false } }).exec();
+      await Location.updateOne({ _id: target._id }, { $set: { selectedLocation: true } }).exec();
+      updatedLocation = await Location.findById(target._id).lean().exec();
+    }
+
+    return res.status(200).json({ success: true, location: updatedLocation });
+  } catch (err: any) {
+    console.error("PATCH /locations/:id/select error:", err);
+    return res.status(500).json({ success: false, message: "Server error", error: err?.message ?? String(err) });
   }
 });
 

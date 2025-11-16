@@ -8,6 +8,7 @@ export interface ILocation extends Document {
   displayName?: string;
   floor?: string;
   note?: string;
+  selectedLocation: boolean; // ✅ new field
 }
 
 const locationSchema = new Schema<ILocation>(
@@ -23,6 +24,7 @@ const locationSchema = new Schema<ILocation>(
     displayName: { type: String },
     floor: { type: String },
     note: { type: String },
+    selectedLocation: { type: Boolean, default: true }, // ✅ default true
   },
   { timestamps: true }
 );

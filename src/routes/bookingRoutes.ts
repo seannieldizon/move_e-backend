@@ -5,6 +5,7 @@ import BusinessInfo from "../models/business_info";
 import ServiceOffered from "../models/services_offered";
 import Booking from "../models/booking";
 import admin from "firebase-admin";
+import Location from "../models/location";
 
 const router = Router();
 
@@ -74,67 +75,47 @@ router.post("/add-bookings", async (req: Request, res: Response) => {
       metadata,
     } = req.body ?? {};
 
-    if (
-      !clientId ||
-      !businessId ||
-      !serviceTitle ||
-      !scheduledAt ||
-      !contactName ||
-      !contactPhone
-    ) {
-      return res
-        .status(400)
-        .json({ message: "Missing required booking fields." });
+    // Basic required fields
+    if (!clientId || !businessId || !serviceTitle || !scheduledAt || !contactName || !contactPhone) {
+      return res.status(400).json({ message: "Missing required booking fields." });
     }
 
-    if (
-      !mongoose.isValidObjectId(clientId) ||
-      !mongoose.isValidObjectId(businessId)
-    ) {
-      return res
-        .status(400)
-        .json({ message: "Invalid clientId or businessId." });
+    if (!mongoose.isValidObjectId(clientId) || !mongoose.isValidObjectId(businessId)) {
+      return res.status(400).json({ message: "Invalid clientId or businessId." });
     }
-
     if (serviceId && !mongoose.isValidObjectId(serviceId)) {
       return res.status(400).json({ message: "Invalid serviceId." });
     }
 
-    // Ensure client exists and fetch full business document (we need operatingSchedule)
+    // Ensure client exists and fetch business doc
     const [clientExists, businessDoc] = await Promise.all([
       User.findById(clientId).select("_id").lean().exec(),
       BusinessInfo.findById(businessId).lean().exec(),
     ]);
-    if (!clientExists)
-      return res.status(404).json({ message: "Client not found." });
-    if (!businessDoc)
-      return res.status(404).json({ message: "Business not found." });
 
-    // If serviceId provided, attempt to resolve title/price/duration when missing
+    if (!clientExists) return res.status(404).json({ message: "Client not found." });
+    if (!businessDoc) return res.status(404).json({ message: "Business not found." });
+
+    // Resolve service details if a serviceId is provided and any of title/price/duration missing
     let resolvedTitle = serviceTitle;
     let resolvedPrice = servicePrice;
     let resolvedDuration = serviceDuration;
     if (serviceId) {
       const svc = await ServiceOffered.findById(serviceId).lean().exec();
       if (svc) {
-        if (!resolvedTitle) resolvedTitle = (svc as any).title;
-        if (resolvedPrice == null && (svc as any).price != null)
-          resolvedPrice = (svc as any).price;
-        if (!resolvedDuration && (svc as any).duration)
-          resolvedDuration = (svc as any).duration;
+        if (!resolvedTitle) resolvedTitle = (svc as any).title ?? resolvedTitle;
+        if (resolvedPrice == null && (svc as any).price != null) resolvedPrice = (svc as any).price;
+        if (!resolvedDuration && (svc as any).duration) resolvedDuration = (svc as any).duration;
       }
     }
 
     const parsedDate = new Date(scheduledAt);
     if (Number.isNaN(parsedDate.getTime())) {
-      return res
-        .status(400)
-        .json({ message: "scheduledAt must be a valid date/time string." });
+      return res.status(400).json({ message: "scheduledAt must be a valid date/time string." });
     }
 
-    // --- Validate against operatingSchedule from BusinessInfo model ---
+    // --- Validate against business operatingSchedule if present ---
     const rawSchedule = (businessDoc as any).operatingSchedule ?? null;
-
     if (rawSchedule) {
       const weekday = parsedDate.getDay(); // 0 = Sunday .. 6 = Saturday
       const key = weekdayIndexToKey(weekday);
@@ -153,10 +134,7 @@ router.post("/add-bookings", async (req: Request, res: Response) => {
       const openStr = entry?.open ?? null;
       const closeStr = entry?.close ?? null;
 
-      if (
-        parseTimeToMinutes(openStr) != null &&
-        parseTimeToMinutes(closeStr) != null
-      ) {
+      if (parseTimeToMinutes(openStr) != null && parseTimeToMinutes(closeStr) != null) {
         const ok = isTimeWithinOpenClose(parsedDate, openStr, closeStr);
         if (!ok) {
           const allowed = formatDayAllowedRangesForKey(rawSchedule, key);
@@ -170,15 +148,13 @@ router.post("/add-bookings", async (req: Request, res: Response) => {
       } else {
         const allowed = formatDayAllowedRangesForKey(rawSchedule, key);
         return res.status(400).json({
-          message:
-            "Business operating hours not available for the requested day (treated as closed).",
+          message: "Business operating hours not available for the requested day (treated as closed).",
           day: key,
           allowed,
           requested: parsedDate.toISOString(),
         });
       }
     }
-    // If no operatingSchedule is defined, allow booking (legacy behavior)
 
     // Build booking document
     const bookingDoc = new Booking({
@@ -197,18 +173,78 @@ router.post("/add-bookings", async (req: Request, res: Response) => {
       paymentStatus: "pending",
     });
 
+    // --- Find client's currently selected Location and copy address/lat/lng/floor/note ---
+    try {
+      const selectedLocation = (await Location.findOne({
+        clientId: new mongoose.Types.ObjectId(clientId),
+        selectedLocation: true,
+      }).lean().exec()) as any | null;
+
+      if (selectedLocation) {
+        // Address candidates (support multiple possible field names)
+        const addrCandidate =
+          (selectedLocation.address ??
+            selectedLocation.displayName ??
+            selectedLocation.display ??
+            selectedLocation.name) ?? "";
+
+        // Lat/lon candidates
+        const latCandidate =
+          selectedLocation.latitude ?? selectedLocation.lat ?? selectedLocation.latlng?.lat ?? null;
+        const lonCandidate =
+          selectedLocation.longitude ?? selectedLocation.lon ?? selectedLocation.lng ?? selectedLocation.latlng?.lng ?? null;
+
+        // Floor and note candidates (common field names)
+        const floorCandidate =
+          selectedLocation.floor ??
+          selectedLocation.floorNumber ??
+          selectedLocation.level ??
+          selectedLocation.unit ??
+          selectedLocation.unitNumber ??
+          null;
+
+        const noteCandidate =
+          selectedLocation.note ??
+          selectedLocation.notes ??
+          selectedLocation.description ??
+          selectedLocation.instructions ??
+          null;
+
+        const addr = typeof addrCandidate === "string" ? addrCandidate.trim() : "";
+        const lat = latCandidate != null ? Number(latCandidate) : NaN;
+        const lon = lonCandidate != null ? Number(lonCandidate) : NaN;
+
+        const floor =
+          floorCandidate !== null && floorCandidate !== undefined
+            ? String(floorCandidate).trim()
+            : undefined;
+        const note =
+          noteCandidate !== null && noteCandidate !== undefined ? String(noteCandidate).trim() : undefined;
+
+        if (addr.length > 0 && !Number.isNaN(lat) && !Number.isNaN(lon)) {
+          (bookingDoc as any).location = {
+            address: addr,
+            latitude: lat,
+            longitude: lon,
+            ...(floor ? { floor } : {}),
+            ...(note ? { note } : {}),
+          };
+        }
+      }
+    } catch (locErr) {
+      console.warn("Failed to lookup selected location for client:", locErr);
+    }
+
+    // Save booking
     await bookingDoc.save();
 
-    // --- Send push notification to the business/provider (best-effort) ---
+    // --- Send push notification to business/provider (best-effort) ---
     let notificationResult: any = null;
     try {
       const tokens: string[] = [];
 
       // 1) check businessDoc.fcmTokens (array)
-      if (
-        (businessDoc as any).fcmTokens &&
-        Array.isArray((businessDoc as any).fcmTokens)
-      ) {
+      if ((businessDoc as any).fcmTokens && Array.isArray((businessDoc as any).fcmTokens)) {
         for (const t of (businessDoc as any).fcmTokens) {
           if (typeof t === "string" && t.trim().length > 0) tokens.push(t);
         }
@@ -217,10 +253,7 @@ router.post("/add-bookings", async (req: Request, res: Response) => {
       // 2) fallback: fetch provider user by businessDoc.clientId to get user's fcmToken
       if (tokens.length === 0 && (businessDoc as any).clientId) {
         try {
-          const owner = await User.findById((businessDoc as any).clientId)
-            .select("fcmToken")
-            .lean()
-            .exec();
+          const owner = await User.findById((businessDoc as any).clientId).select("fcmToken").lean().exec();
           if (owner && (owner as any).fcmToken) {
             const t = (owner as any).fcmToken;
             if (typeof t === "string" && t.trim().length > 0) tokens.push(t);
@@ -231,24 +264,18 @@ router.post("/add-bookings", async (req: Request, res: Response) => {
       }
 
       if (tokens.length === 0) {
-        notificationResult = {
-          note: "No fcm tokens found for business/provider.",
-        };
+        notificationResult = { note: "No fcm tokens found for business/provider." };
       } else {
-        // Compose notification (use ISO for data so client can format)
+        // Compose notification
         const title = "New booking request";
-        // Format date/time like "December 20, 2025 at 12:00 PM"
-        const formattedDateTime = bookingDoc.scheduledAt.toLocaleString(
-          "en-US",
-          {
-            month: "long",
-            day: "numeric",
-            year: "numeric",
-            hour: "numeric",
-            minute: "2-digit",
-            hour12: true,
-          }
-        );
+        const formattedDateTime = bookingDoc.scheduledAt.toLocaleString("en-US", {
+          month: "long",
+          day: "numeric",
+          year: "numeric",
+          hour: "numeric",
+          minute: "2-digit",
+          hour12: true,
+        });
 
         const body = `${bookingDoc.contactName} requested ${bookingDoc.serviceTitle} on ${formattedDateTime}`;
 
@@ -259,7 +286,6 @@ router.post("/add-bookings", async (req: Request, res: Response) => {
           scheduledAt: bookingDoc.scheduledAt.toISOString(),
         };
 
-        // Modern multicast message (preferred)
         const multicastMessage: any = {
           tokens,
           notification: { title, body },
@@ -284,12 +310,6 @@ router.post("/add-bookings", async (req: Request, res: Response) => {
           },
         };
 
-        console.info(
-          "FCM payload being sent:",
-          JSON.stringify(multicastMessage, null, 2)
-        );
-
-        // Legacy payload for sendToDevice (fallback)
         const legacyPayload: any = {
           notification: { title, body },
           data: dataPayload,
@@ -312,79 +332,48 @@ router.post("/add-bookings", async (req: Request, res: Response) => {
           },
         };
 
-        const messaging = (admin as any).messaging();
-        notificationResult = {
-          successCount: 0,
-          failureCount: 0,
-          responses: [],
-        };
+        const messaging = (admin as any)?.messaging?.();
+        notificationResult = { successCount: 0, failureCount: 0, responses: [] as any[] };
         const failedTokens: string[] = [];
 
-        // Prefer modern Admin SDK API: sendEachForMulticast (v13+)
         if (messaging && typeof messaging.sendEachForMulticast === "function") {
-          const sendRes = await messaging.sendEachForMulticast(
-            multicastMessage
-          );
+          const sendRes = await messaging.sendEachForMulticast(multicastMessage);
           notificationResult.successCount = sendRes.successCount ?? 0;
           notificationResult.failureCount = sendRes.failureCount ?? 0;
 
           (sendRes.responses ?? []).forEach((r: any, i: number) => {
-            notificationResult.responses.push({
-              success: !!r.success,
-              error: r.error ? String(r.error) : undefined,
-            });
+            notificationResult.responses.push({ success: !!r.success, error: r.error ? String(r.error) : undefined });
             if (!r.success) {
               const code = r.error?.code ?? String(r.error);
-              if (
-                code === "messaging/registration-token-not-registered" ||
-                code === "messaging/invalid-registration-token"
-              ) {
+              if (code === "messaging/registration-token-not-registered" || code === "messaging/invalid-registration-token") {
                 failedTokens.push(tokens[i]);
               }
             }
           });
-        }
-        // Fallback: older Admin SDKs may have sendMulticast
-        else if (messaging && typeof messaging.sendMulticast === "function") {
+        } else if (messaging && typeof messaging.sendMulticast === "function") {
           const sendRes = await messaging.sendMulticast(multicastMessage);
           notificationResult.successCount = sendRes.successCount ?? 0;
           notificationResult.failureCount = sendRes.failureCount ?? 0;
-
           (sendRes.responses ?? []).forEach((r: any, i: number) => {
-            notificationResult.responses.push({
-              success: !!r.success,
-              error: r.error ? String(r.error) : undefined,
-            });
+            notificationResult.responses.push({ success: !!r.success, error: r.error ? String(r.error) : undefined });
             if (!r.success) {
               const code = r.error?.code ?? String(r.error);
-              if (
-                code === "messaging/registration-token-not-registered" ||
-                code === "messaging/invalid-registration-token"
-              ) {
+              if (code === "messaging/registration-token-not-registered" || code === "messaging/invalid-registration-token") {
                 failedTokens.push(tokens[i]);
               }
             }
           });
-        }
-        // Last fallback: sendToDevice (legacy)
-        else if (messaging && typeof messaging.sendToDevice === "function") {
+        } else if (messaging && typeof messaging.sendToDevice === "function") {
           const sendRes = await messaging.sendToDevice(tokens, legacyPayload);
           const results = sendRes.results ?? sendRes.responses ?? sendRes;
           let successCount = 0;
           let failureCount = 0;
-
           (results ?? []).forEach((r: any, i: number) => {
             if (r && r.error) {
               failureCount++;
               const code = r.error.code ?? String(r.error);
-              notificationResult.responses.push({
-                success: false,
-                error: code,
-              });
-              if (
-                code === "messaging/registration-token-not-registered" ||
-                code === "messaging/invalid-registration-token"
-              ) {
+              notificationResult.responses.push({ success: false, error: code });
+              if (code === "messaging/registration-token-not-registered" || code === "messaging/invalid-registration-token") {
                 failedTokens.push(tokens[i]);
               }
             } else {
@@ -392,24 +381,17 @@ router.post("/add-bookings", async (req: Request, res: Response) => {
               notificationResult.responses.push({ success: true });
             }
           });
-
           notificationResult.successCount = successCount;
           notificationResult.failureCount = failureCount;
         } else {
-          // No available messaging API
-          throw new Error(
-            "Firebase Messaging API not available on server (no sendEachForMulticast/sendMulticast/sendToDevice)."
-          );
+          // Messaging not available or admin not initialized
+          notificationResult = { note: "Firebase messaging not available on server." };
         }
 
-        // Prune invalid tokens from BusinessInfo.fcmTokens
+        // Remove invalid tokens from businessDoc.fcmTokens
         if (failedTokens.length > 0) {
           try {
-            await BusinessInfo.updateOne(
-              { _id: businessId },
-              { $pull: { fcmTokens: { $in: failedTokens } } }
-            ).exec();
-            console.info("Removed invalid fcm tokens:", failedTokens);
+            await BusinessInfo.updateOne({ _id: businessId }, { $pull: { fcmTokens: { $in: failedTokens } } }).exec();
             notificationResult.removedInvalidTokens = failedTokens;
           } catch (e) {
             console.warn("Failed to remove invalid tokens:", e);
@@ -419,9 +401,7 @@ router.post("/add-bookings", async (req: Request, res: Response) => {
       }
     } catch (notifErr) {
       console.error("Failed to send booking notification:", notifErr);
-      notificationResult = {
-        error: notifErr instanceof Error ? notifErr.message : String(notifErr),
-      };
+      notificationResult = { error: notifErr instanceof Error ? notifErr.message : String(notifErr) };
     }
 
     // Return booking + optional notification result
@@ -431,12 +411,11 @@ router.post("/add-bookings", async (req: Request, res: Response) => {
       notification: notificationResult,
     });
   } catch (err) {
-    console.error("POST /bookings error:", err);
-    return res
-      .status(500)
-      .json({ message: "Server error.", error: (err as Error).message });
+    console.error("POST /add-bookings error:", err);
+    return res.status(500).json({ message: "Server error.", error: (err as Error).message });
   }
 });
+
 
 router.post("/:id/cancel-booking", async (req: Request, res: Response) => {
   try {
@@ -559,13 +538,24 @@ router.get("/by-business/:businessId", async (req: Request, res: Response) => {
       .lean()
       .exec();
 
+    // 🔹 Convert UTC time → Manila time (UTC+8)
+    const manilaOffset = 8 * 60 * 60 * 1000; // 8 hours in ms
+    const converted = bookings.map((b) => {
+      if (b.scheduledAt) {
+        const utcDate = new Date(b.scheduledAt);
+        const manilaDate = new Date(utcDate.getTime() + manilaOffset);
+        return { ...b, scheduledAt: manilaDate };
+      }
+      return b;
+    });
+
     return res.status(200).json({
       message: "Bookings fetched.",
       total,
       page: pg,
       limit: lim,
-      business: businessExists, // include business basic data (including operatingSchedule)
-      bookings,
+      business: businessExists,
+      bookings: converted, // ⬅️ use converted version
     });
   } catch (err) {
     console.error("GET /bookings/by-business error:", err);
@@ -574,6 +564,229 @@ router.get("/by-business/:businessId", async (req: Request, res: Response) => {
       .json({ message: "Server error.", error: (err as Error).message });
   }
 });
+
+// POST /reject/:id
+router.post("/reject/:id", async (req: Request, res: Response) => {
+  try {
+    const bookingId = req.params.id;
+    const { reason, actorId } = req.body ?? {};
+
+    if (!bookingId || !mongoose.isValidObjectId(bookingId)) {
+      return res.status(400).json({ success: false, message: "Invalid booking id" });
+    }
+
+    // find booking
+    const booking = await Booking.findById(bookingId).exec();
+    if (!booking) {
+      return res.status(404).json({ success: false, message: "Booking not found" });
+    }
+
+    const currentStatus = (booking.status ?? "").toString().toLowerCase();
+    if (["cancelled", "completed", "rejected"].includes(currentStatus)) {
+      return res.status(409).json({
+        success: false,
+        message: `Cannot reject booking with status '${booking.status}'`,
+      });
+    }
+
+    // update booking
+    booking.status = "rejected";
+    if (reason && typeof reason === "string" && reason.trim().length > 0) {
+      // store trimmed reason
+      (booking as any).rejectionReason = reason.trim();
+    } else {
+      // ensure field is unset if not provided
+      (booking as any).rejectionReason = undefined;
+    }
+    booking.updatedAt = new Date();
+
+    await booking.save();
+
+    // populate to return richer object
+    const populated = (await Booking.findById(booking._id)
+  .populate({ path: "clientId", select: "firstName lastName email phone fcmToken fcmTokens", model: User })
+  .populate({ path: "businessId", select: "businessName location", model: BusinessInfo })
+  .populate({ path: "serviceId", select: "title price duration", model: ServiceOffered })
+  .lean()
+  .exec()) as any;
+
+    // Try to send notification to client (best-effort)
+    let notificationResult: any = null;
+    try {
+      // collect tokens from client doc (support fcmToken single or fcmTokens array)
+      const clientDoc = populated?.clientId as any | null;
+      const tokens: string[] = [];
+
+      if (clientDoc) {
+        if (Array.isArray(clientDoc.fcmTokens)) {
+          for (const t of clientDoc.fcmTokens) {
+            if (typeof t === "string" && t.trim()) tokens.push(t);
+          }
+        }
+        if (!clientDoc.fcmTokens && typeof clientDoc.fcmToken === "string" && clientDoc.fcmToken.trim()) {
+          tokens.push(clientDoc.fcmToken);
+        }
+      }
+
+      if (tokens.length === 0) {
+        notificationResult = { note: "No fcm tokens found for client." };
+      } else {
+        // Compose notification
+        const title = "Booking rejected";
+        const formattedDateTime = booking.scheduledAt
+          ? new Date(booking.scheduledAt).toLocaleString("en-US", {
+              month: "long",
+              day: "numeric",
+              year: "numeric",
+              hour: "numeric",
+              minute: "2-digit",
+              hour12: true,
+            })
+          : "";
+
+        const serviceTitle = (booking as any).serviceTitle ?? (populated?.serviceId?.title ?? "your booking");
+        const body = reason && typeof reason === "string" && reason.trim().length > 0
+          ? `${serviceTitle} scheduled on ${formattedDateTime} was rejected. Reason: ${String(reason).trim()}`
+          : `${serviceTitle} scheduled on ${formattedDateTime} was rejected.`;
+
+        const dataPayload: Record<string, string> = {
+          bookingId: String(booking._id),
+          type: "booking_rejected",
+        };
+
+        const multicastMessage: any = {
+          tokens,
+          notification: { title, body },
+          data: dataPayload,
+          android: {
+            priority: "high",
+            notification: {
+              channelId: "bookings",
+              clickAction: "FLUTTER_NOTIFICATION_CLICK",
+              sound: "default",
+            },
+          },
+          apns: {
+            headers: { "apns-priority": "10" },
+            payload: {
+              aps: {
+                alert: { title, body },
+                sound: "default",
+                category: "BOOKING_REJECTED",
+              },
+            },
+          },
+        };
+
+        const legacyPayload: any = {
+          notification: { title, body },
+          data: dataPayload,
+          android: {
+            priority: "high",
+            notification: {
+              channelId: "bookings",
+              click_action: "FLUTTER_NOTIFICATION_CLICK",
+            },
+          },
+          apns: {
+            headers: { "apns-priority": "10" },
+            payload: {
+              aps: {
+                alert: { title, body },
+                sound: "default",
+                category: "BOOKING_REJECTED",
+              },
+            },
+          },
+        };
+
+        const messaging = (admin as any)?.messaging?.();
+        notificationResult = { successCount: 0, failureCount: 0, responses: [] as any[] };
+        const failedTokens: string[] = [];
+
+        if (messaging && typeof messaging.sendEachForMulticast === "function") {
+          const sendRes = await messaging.sendEachForMulticast(multicastMessage);
+          notificationResult.successCount = sendRes.successCount ?? 0;
+          notificationResult.failureCount = sendRes.failureCount ?? 0;
+          (sendRes.responses ?? []).forEach((r: any, i: number) => {
+            notificationResult.responses.push({ success: !!r.success, error: r.error ? String(r.error) : undefined });
+            if (!r.success) {
+              const code = r.error?.code ?? String(r.error);
+              if (code === "messaging/registration-token-not-registered" || code === "messaging/invalid-registration-token") {
+                failedTokens.push(tokens[i]);
+              }
+            }
+          });
+        } else if (messaging && typeof messaging.sendMulticast === "function") {
+          const sendRes = await messaging.sendMulticast(multicastMessage);
+          notificationResult.successCount = sendRes.successCount ?? 0;
+          notificationResult.failureCount = sendRes.failureCount ?? 0;
+          (sendRes.responses ?? []).forEach((r: any, i: number) => {
+            notificationResult.responses.push({ success: !!r.success, error: r.error ? String(r.error) : undefined });
+            if (!r.success) {
+              const code = r.error?.code ?? String(r.error);
+              if (code === "messaging/registration-token-not-registered" || code === "messaging/invalid-registration-token") {
+                failedTokens.push(tokens[i]);
+              }
+            }
+          });
+        } else if (messaging && typeof messaging.sendToDevice === "function") {
+          const sendRes = await messaging.sendToDevice(tokens, legacyPayload);
+          const results = sendRes.results ?? sendRes.responses ?? sendRes;
+          let successCount = 0;
+          let failureCount = 0;
+          (results ?? []).forEach((r: any, i: number) => {
+            if (r && r.error) {
+              failureCount++;
+              const code = r.error.code ?? String(r.error);
+              notificationResult.responses.push({ success: false, error: code });
+              if (code === "messaging/registration-token-not-registered" || code === "messaging/invalid-registration-token") {
+                failedTokens.push(tokens[i]);
+              }
+            } else {
+              successCount++;
+              notificationResult.responses.push({ success: true });
+            }
+          });
+          notificationResult.successCount = successCount;
+          notificationResult.failureCount = failureCount;
+        } else {
+          notificationResult = { note: "Firebase messaging not available on server." };
+        }
+
+        // prune invalid tokens from user document if applicable
+        if (failedTokens.length > 0 && clientDoc && clientDoc._id) {
+          try {
+            // try to remove from either fcmTokens array or single fcmToken
+            if (Array.isArray((clientDoc as any).fcmTokens)) {
+              await User.updateOne({ _id: clientDoc._id }, { $pull: { fcmTokens: { $in: failedTokens } } }).exec();
+              notificationResult.removedInvalidTokens = failedTokens;
+            } else if ((clientDoc as any).fcmToken && failedTokens.includes((clientDoc as any).fcmToken)) {
+              await User.updateOne({ _id: clientDoc._id }, { $unset: { fcmToken: 1 } }).exec();
+              notificationResult.removedInvalidTokens = failedTokens;
+            }
+          } catch (e) {
+            notificationResult.removeError = String(e);
+          }
+        }
+      }
+    } catch (notifErr) {
+      console.error("Failed to send rejection notification:", notifErr);
+      notificationResult = { error: notifErr instanceof Error ? notifErr.message : String(notifErr) };
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: "Booking rejected.",
+      booking: populated,
+      notification: notificationResult,
+    });
+  } catch (err) {
+    console.error("POST /reject/:id error:", err);
+    return res.status(500).json({ success: false, message: "Server error", error: (err as Error).message });
+  }
+});
+
 
 router.get("/quickbook", async (req: Request, res: Response) => {
   try {

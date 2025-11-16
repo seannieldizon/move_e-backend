@@ -969,11 +969,18 @@ router.post("/remove-fcm-token", async (req: Request, res: Response) => {
 
 router.get("/bookings/today", async (req: Request, res: Response) => {
   try {
-    const businessId = (req.header("x-business-id") || req.query.businessId) as string | undefined;
+    const businessId = (req.header("x-business-id") || req.query.businessId) as
+      | string
+      | undefined;
     const tz = (req.query.tz as string) || "Asia/Manila";
 
     if (!businessId) {
-      return res.status(400).json({ message: "Missing businessId (provide as header x-business-id or ?businessId=...)" });
+      return res
+        .status(400)
+        .json({
+          message:
+            "Missing businessId (provide as header x-business-id or ?businessId=...)",
+        });
     }
 
     if (!mongoose.isValidObjectId(businessId)) {
@@ -983,7 +990,11 @@ router.get("/bookings/today", async (req: Request, res: Response) => {
     // Determine start/end of "today" in the requested timezone (for filtering)
     const nowInTz = DateTime.now().setZone(tz);
     if (!nowInTz.isValid) {
-      return res.status(400).json({ message: `Invalid timezone '${tz}'. Use an IANA timezone like 'Asia/Manila'.` });
+      return res
+        .status(400)
+        .json({
+          message: `Invalid timezone '${tz}'. Use an IANA timezone like 'Asia/Manila'.`,
+        });
     }
 
     const startOfDay = nowInTz.startOf("day").toJSDate();
@@ -998,32 +1009,37 @@ router.get("/bookings/today", async (req: Request, res: Response) => {
       .lean()
       .exec();
 
-    // 🧭 Format scheduledAt as stored (no timezone conversion)
+    // Convert each booking's scheduledAt to requested timezone (e.g. Asia/Manila)
     const bookingsWithFormatted = bookings.map((b) => {
-      // interpret the raw date as-is, in UTC (no .setZone)
-      const dt = DateTime.fromJSDate(new Date(b.scheduledAt)).toUTC();
-      const formatted =
-        dt.toLocaleString({
-          month: "long",
-          day: "numeric",
-          year: "numeric",
-        }) +
-        " at " +
-        dt.toLocaleString({
-          hour: "numeric",
-          minute: "2-digit",
-          hour12: true,
-        });
+      const rawDate = b.scheduledAt ? new Date(b.scheduledAt) : null;
+      let dtInZone = null;
+
+      if (rawDate) {
+        // Interpret stored JS Date (UTC instant) and represent it in the requested zone
+        dtInZone = DateTime.fromJSDate(rawDate).setZone(tz);
+      }
+
+      const scheduledAtFormatted = dtInZone
+        ? `${dtInZone.toLocaleString({ month: "long", day: "numeric", year: "numeric" })} at ${dtInZone.toLocaleString({
+            hour: "numeric",
+            minute: "2-digit",
+            hour12: true,
+          })}`
+        : null;
+
+      // ISO string with offset (e.g. 2025-11-06T10:00:00+08:00)
+      const scheduledAtLocalIso = dtInZone ? dtInZone.toISO() : null;
 
       return {
         ...b,
-        scheduledAtFormatted: formatted,
+        scheduledAtFormatted,
+        scheduledAtLocalIso,
       };
     });
 
     return res.status(200).json({
       message: "Bookings for today",
-      timezone: "UTC", // clarify that formatting is in UTC
+      timezone: tz,
       date: nowInTz.toISODate(),
       count: bookingsWithFormatted.length,
       bookings: bookingsWithFormatted,
@@ -1036,6 +1052,7 @@ router.get("/bookings/today", async (req: Request, res: Response) => {
     });
   }
 });
+
 
 router.get("/services/count", async (req: Request, res: Response) => {
   try {

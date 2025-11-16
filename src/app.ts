@@ -52,7 +52,7 @@ if (!admin.apps.length) {
   }
 }
 
-const MONGO_URI = process.env.MONGO_URI || "mongodb://127.0.0.1:27017/eduvision";
+const MONGO_URI = process.env.MONGO_URI || "mongodb://127.0.0.1:27017/move-e";
 mongoose
   .connect(MONGO_URI)
   .then(() => console.log("Connected to MongoDB"))
