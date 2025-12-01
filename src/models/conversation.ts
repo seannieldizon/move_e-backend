@@ -49,4 +49,7 @@ ConversationSchema.index(
   { unique: true }
 );
 
-export default mongoose.model<IConversation>("Conversation", ConversationSchema);
+export default mongoose.model<IConversation>(
+  "Conversation",
+  ConversationSchema
+);

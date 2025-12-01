@@ -9,8 +9,18 @@ import BusinessInfo from "../models/business_info";
 import ServiceOffered from "../models/services_offered";
 import Booking from "../models/booking";
 import { DateTime } from "luxon";
+import nodemailer from "nodemailer";
+import Review from "../models/review";
 
 const router = Router();
+
+const mailTransporter = nodemailer.createTransport({
+  service: "gmail",
+  auth: {
+    user: process.env.GMAIL_USER,
+    pass: process.env.GMAIL_PASS, // app password or OAuth2 token
+  },
+});
 
 router.get("/", (req, res) => {
   res.status(200).send("✅ Move-E Backend is running!");
@@ -717,6 +727,383 @@ router.get("/bookings/today", async (req: Request, res: Response) => {
   } catch (err) {
     console.error("GET /client/bookings/today error:", err);
     return res.status(500).json({ message: "Server error", error: (err as Error).message });
+  }
+});
+
+// Add these two routes to routes/client.ts (or the file you showed).
+// They expect this router to be mounted at /api/client (so full path will be /api/client/forgot-password and /api/client/reset-password)
+
+router.post("/forgot-password", async (req: Request, res: Response) => {
+  try {
+    const { email, phone, identifier } = req.body ?? {};
+    const id = (identifier ?? email ?? phone ?? "").toString().trim();
+
+    if (!id) {
+      return res.status(400).json({ message: "Please provide email or phone (identifier)." });
+    }
+
+    // Find user by email OR phone
+    const isEmail = typeof id === "string" && id.includes("@");
+    const user = await User.findOne(isEmail ? { email: id } : { phone: id }).exec();
+
+    if (!user) {
+      // Generic response to avoid account enumeration
+      return res.status(200).json({ message: "A verification code was sent." });
+    }
+
+    // Generate a 6-digit numeric code
+    const code = Math.floor(100000 + Math.random() * 900000).toString();
+
+    // Hash the code before storing for safety
+    const hashed = await bcrypt.hash(code, 10);
+
+    // Save hashed code and expiry (e.g. 15 minutes)
+    (user as any).resetCode = hashed;
+    (user as any).resetCodeExpires = Date.now() + 15 * 60 * 1000; // 15 minutes
+    (user as any).resetRequestedAt = Date.now();
+
+    await user.save();
+
+    // Compose the email
+    const recipientEmail = (user as any).email ?? id; // fallback to provided id if user.email missing
+    const mailOptions = {
+      from: `"Move-E Support" <${process.env.GMAIL_USER}>`,
+      to: recipientEmail,
+      subject: "Your Move-E password reset code",
+      text:
+        `You requested to reset your Move-E password.\n\n` +
+        `Use the following verification code to reset your password:\n\n` +
+        `    ${code}\n\n` +
+        `This code will expire in 15 minutes.\n\n` +
+        `If you did not request this, please ignore this message.\n\n` +
+        `— Move-E Team`,
+      html:
+        `<p>You requested to reset your Move-E password.</p>` +
+        `<p><strong>Use the following verification code to reset your password:</strong></p>` +
+        `<h2 style="letter-spacing:4px;">${code}</h2>` +
+        `<p>This code will expire in 15 minutes.</p>` +
+        `<p>If you did not request this, please ignore this message.</p>` +
+        `<hr/><p style="font-size:12px;color:#666">Move-E</p>`,
+    };
+
+    // Send the email (don't reveal success/failure to caller beyond generic message)
+    try {
+      const info = await mailTransporter.sendMail(mailOptions);
+      // Helpful debug log for server-side only (do not expose to clients)
+      console.log(`[forgot-password] Sent reset email to ${recipientEmail} for user=${user._id}. nodemailerMessageId=${info.messageId}`);
+    } catch (mailErr) {
+      // Log error but do NOT expose to clients (still respond generically)
+      console.error(`[forgot-password] Failed to send email to ${recipientEmail}:`, mailErr);
+      // Optionally: you can still allow resetCode to exist even if email sending fails,
+      // or you can rollback by unsetting reset fields. Here we keep the code and still return generic 200.
+    }
+
+    // Return generic success to the client
+    return res.status(200).json({ message: "If an account exists, a verification code was sent." });
+  } catch (err: any) {
+    console.error("POST /forgot-password error:", err);
+    return res.status(500).json({ message: "Server error", error: err?.message ?? String(err) });
+  }
+});
+
+router.post("/reset-password", async (req: Request, res: Response) => {
+  try {
+    // Expect: identifier (email/phone), code, password, password_confirmation (or confirm)
+    const { identifier, email, phone, code, password, password_confirmation } = req.body ?? {};
+
+    const id = (identifier ?? email ?? phone ?? "").toString().trim();
+    if (!id) return res.status(400).json({ message: "Identifier (email or phone) is required." });
+    if (!code) return res.status(400).json({ message: "Verification code is required." });
+    if (!password) return res.status(400).json({ message: "Password is required." });
+    if (password_confirmation && password !== password_confirmation) {
+      return res.status(400).json({ message: "Password and confirmation do not match." });
+    }
+
+    const isEmail = typeof id === "string" && id.includes("@");
+    const user = await User.findOne(isEmail ? { email: id } : { phone: id }).exec();
+
+    if (!user) return res.status(404).json({ message: "Account not found." });
+
+    const storedHash = (user as any).resetCode;
+    const expires = (user as any).resetCodeExpires;
+
+    if (!storedHash || !expires) {
+      return res.status(400).json({ message: "No reset request found for this account. Please request a code first." });
+    }
+
+    if (Date.now() > Number(expires)) {
+      // Clear expired code fields
+      (user as any).resetCode = undefined;
+      (user as any).resetCodeExpires = undefined;
+      await user.save();
+      return res.status(400).json({ message: "Verification code has expired. Please request a new code." });
+    }
+
+    // Compare provided code with stored hashed code
+    const ok = await bcrypt.compare(String(code), storedHash);
+    if (!ok) {
+      return res.status(400).json({ message: "Invalid verification code." });
+    }
+
+    // All good — hash new password and save
+    const newHashed = await bcrypt.hash(String(password), 10);
+    (user as any).password = newHashed;
+
+    // Clear reset fields
+    (user as any).resetCode = undefined;
+    (user as any).resetCodeExpires = undefined;
+
+    await user.save();
+
+    return res.status(200).json({ message: "Password has been reset successfully." });
+  } catch (err: any) {
+    console.error("POST /reset-password error:", err);
+    return res.status(500).json({ message: "Server error", error: err?.message ?? String(err) });
+  }
+});
+
+router.post("/add-reviews", async (req: Request, res: Response) => {
+  try {
+    const { businessId, rating, text, photoUrls, clientId, authorName } = req.body ?? {};
+
+    if (!businessId || typeof businessId !== "string") {
+      return res.status(400).json({ message: "businessId is required in body." });
+    }
+    if (!mongoose.isValidObjectId(businessId)) {
+      return res.status(400).json({ message: "Invalid businessId format." });
+    }
+
+    const r = Number(rating);
+    if (rating == null || Number.isNaN(r) || !Number.isInteger(r) || r < 1 || r > 5) {
+      return res.status(400).json({ message: "rating is required and must be an integer between 1 and 5." });
+    }
+
+    // Validate optional clientId if provided
+    let clientObjId: mongoose.Types.ObjectId | undefined;
+    if (clientId) {
+      if (!mongoose.isValidObjectId(clientId)) {
+        return res.status(400).json({ message: "Invalid clientId format." });
+      }
+      clientObjId = new mongoose.Types.ObjectId(clientId);
+    }
+
+    // Verify business exists
+    const business = await BusinessInfo.findById(businessId).exec();
+    if (!business) {
+      return res.status(404).json({ message: "Business not found." });
+    }
+
+    // Build review doc
+    const reviewDoc: any = {
+      businessId: new mongoose.Types.ObjectId(businessId),
+      rating: r,
+    };
+    if (typeof text === "string" && text.trim().length > 0) reviewDoc.text = text.trim();
+
+    // photoUrls: accept array (filter non-empty strings)
+    if (Array.isArray(photoUrls)) {
+      reviewDoc.photoUrls = photoUrls
+        .map((p: any) => (typeof p === "string" ? p.trim() : String(p ?? "")))
+        .filter((s: string) => s.length > 0);
+    }
+
+    if (clientObjId) reviewDoc.clientId = clientObjId;
+    if (authorName && typeof authorName === "string" && authorName.trim().length > 0) {
+      reviewDoc.authorName = authorName.trim();
+    }
+
+    // If clientId is provided and no authorName, attempt to read client's name
+    if (clientObjId && !reviewDoc.authorName) {
+      try {
+        const client = await User.findById(clientObjId)
+          .select("firstName middleName lastName")
+          .lean()
+          .exec();
+
+        if (client) {
+          // Build parts array and remove falsy / empty entries, trim each part
+          const parts = [client.firstName, client.middleName, client.lastName]
+            .filter((p) => typeof p === "string" && p.trim().length > 0)
+            .map((p) => (p as string).trim());
+
+          if (parts.length > 0) {
+            reviewDoc.authorName = parts.join(" ");
+          }
+        }
+      } catch (e) {
+        // ignore failure to read client name (non-fatal)
+        console.warn("Could not load client name for review author:", e);
+      }
+    }
+
+    // Save review
+    const created = new Review(reviewDoc);
+    await created.save();
+
+    // Recompute aggregated stats and update BusinessInfo (average rating)
+    try {
+      // computeStats should be a static method on Review model that returns { avgRating, count }
+      const stats: any = await (Review as any).computeStats(created.businessId);
+      const avg = stats?.avgRating ?? null;
+      const count = stats?.count ?? null;
+
+      const update: any = {};
+      if (avg != null) update.rating = Number(Number(avg).toFixed(2));
+      if (count != null) update.reviewCount = count;
+
+      if (Object.keys(update).length > 0) {
+        await BusinessInfo.updateOne({ _id: created.businessId }, { $set: update }).exec();
+      }
+    } catch (aggErr) {
+      // log and continue — aggregation failure shouldn't block the review creation
+      console.warn("Failed to update business aggregates after new review:", aggErr);
+    }
+
+    // Return the created review (lean)
+    const out = await Review.findById(created._id).lean().exec();
+    return res.status(201).json({ success: true, review: out });
+  } catch (err: any) {
+    console.error("POST /reviews error:", err);
+    return res.status(500).json({ message: "Server error", error: err?.message ?? String(err) });
+  }
+});
+
+// GET /reviews?businessId=<id>&rating=5&page=1&limit=20&sort=newest
+router.get("/reviews", async (req: Request, res: Response) => {
+  try {
+    const { businessId, rating, page, limit, sort } = req.query ?? {};
+
+    if (!businessId || typeof businessId !== "string") {
+      return res.status(400).json({ message: "businessId query param is required" });
+    }
+    if (!mongoose.isValidObjectId(businessId)) {
+      return res.status(400).json({ message: "Invalid businessId format" });
+    }
+
+    // parse optional rating filter
+    let ratingFilter: number | undefined;
+    if (typeof rating !== "undefined") {
+      const r = Number(rating);
+      if (Number.isNaN(r) || !Number.isInteger(r) || r < 1 || r > 5) {
+        return res.status(400).json({ message: "rating must be an integer between 1 and 5" });
+      }
+      ratingFilter = r;
+    }
+
+    // pagination
+    const pageNum = Math.max(1, Number(page ?? 1));
+    const lim = Math.min(200, Math.max(1, Number(limit ?? 20)));
+    const skip = (pageNum - 1) * lim;
+
+    // sort options
+    let sortObj: any = { createdAt: -1 }; // newest
+    const sortStr = String(sort ?? "newest").toLowerCase();
+    if (sortStr === "oldest") sortObj = { createdAt: 1 };
+    if (sortStr === "rating_desc") sortObj = { rating: -1, createdAt: -1 };
+    if (sortStr === "rating_asc") sortObj = { rating: 1, createdAt: -1 };
+
+    // build query
+    const query: any = { businessId: new mongoose.Types.ObjectId(businessId) };
+    if (typeof ratingFilter !== "undefined") query.rating = ratingFilter;
+
+    // find reviews (populate client info to show name if review doesn't include authorName)
+    const reviewsRaw = await Review.find(query)
+      .sort(sortObj)
+      .skip(skip)
+      .limit(lim)
+      .populate({ path: "clientId", select: "firstName middleName lastName" })
+      .lean()
+      .exec();
+
+    // normalize each review for client
+    const reviews = (reviewsRaw || []).map((r: any) => {
+      const ratingVal = typeof r.rating === "number" ? r.rating : Number(r.rating ?? 0);
+      // prefer explicit authorName, fallback to populated client name, fallback to 'Anonymous'
+      let author = "Anonymous";
+      if (r.authorName && typeof r.authorName === "string" && r.authorName.trim().length > 0) {
+        author = r.authorName.trim();
+      } else if (r.clientId && (r.clientId.firstName || r.clientId.lastName || r.clientId.middleName)) {
+        const parts = [
+          r.clientId.firstName,
+          r.clientId.middleName,
+          r.clientId.lastName
+        ].filter((p: any) => typeof p === "string" && p.trim().length > 0).map((p: string) => p.trim());
+        if (parts.length > 0) author = parts.join(" ");
+      } else if (r.name) {
+        author = String(r.name).trim();
+      }
+
+      // parse createdAt
+      let time: Date | null = null;
+      if (r.createdAt) time = new Date(r.createdAt);
+      else if (r.time) time = new Date(r.time);
+
+      return {
+        id: r._id ?? r.id,
+        rating: ratingVal,
+        text: r.text ?? r.comment ?? "",
+        photoUrls: Array.isArray(r.photoUrls) ? r.photoUrls.filter((p: any) => typeof p === "string" && p.trim().length > 0) : [],
+        author,
+        clientId: r.clientId ? (typeof r.clientId._id !== "undefined" ? String(r.clientId._id) : r.clientId) : undefined,
+        time: time ? time.toISOString() : null,
+        raw: r,
+      };
+    });
+
+    // compute aggregate stats (avg + counts per star + total)
+    const agg = await Review.aggregate([
+      { $match: { businessId: new mongoose.Types.ObjectId(businessId) } },
+      {
+        $group: {
+          _id: "$rating",
+          count: { $sum: 1 },
+          // (we won't compute avg per group here)
+        },
+      },
+      { $sort: { _id: -1 } }, // rating descending
+    ]).exec();
+
+    // build counts map 1..5
+    const counts: Record<number, number> = { 5: 0, 4: 0, 3: 0, 2: 0, 1: 0 };
+    let totalReviews = 0;
+    for (const g of agg) {
+      const key = Number(g._id);
+      const c = Number(g.count ?? 0);
+      if (!Number.isNaN(key) && key >= 1 && key <= 5) {
+        counts[key] = c;
+        totalReviews += c;
+      }
+    }
+
+    // avg rating (computed separately to be precise)
+    const avgAgg = await Review.aggregate([
+      { $match: { businessId: new mongoose.Types.ObjectId(businessId) } },
+      { $group: { _id: null, avgRating: { $avg: "$rating" }, count: { $sum: 1 } } },
+    ]).exec();
+
+    const avgRating = (avgAgg && avgAgg[0] && typeof avgAgg[0].avgRating === "number") ? Number(Number(avgAgg[0].avgRating).toFixed(2)) : null;
+    const totalCountFromAgg = (avgAgg && avgAgg[0] && typeof avgAgg[0].count === "number") ? avgAgg[0].count : totalReviews;
+
+    // Provide pagination total (count of all documents matching the query)
+    const totalMatching = await Review.countDocuments(query).exec();
+
+    return res.status(200).json({
+      success: true,
+      businessId,
+      page: pageNum,
+      limit: lim,
+      sort: sortStr,
+      totalMatching,
+      totalReviews: totalCountFromAgg,
+      stats: {
+        avgRating,
+        counts,
+      },
+      reviews,
+    });
+  } catch (err: any) {
+    console.error("GET /reviews error:", err);
+    return res.status(500).json({ message: "Server error", error: err?.message ?? String(err) });
   }
 });
 

@@ -10,6 +10,28 @@ export interface ILocation {
   note?: string;  // optional: additional directions or instructions
 }
 
+export interface ITrackingHistoryEntry {
+  status: string; // human label: Preparing, On the way, Arrived, Completed, etc.
+  message?: string;
+  actorId?: Types.ObjectId | string | null;
+  actorType?: string | null; // e.g. "provider" | "driver" | "system"
+  actorName?: string | null;
+  timestamp: Date;
+  location?: {
+    latitude?: number;
+    longitude?: number;
+    address?: string;
+  };
+  meta?: Record<string, any>;
+  notify?: {
+    push?: boolean;
+    sms?: boolean;
+    email?: boolean;
+  };
+  photos?: string[]; // array of URLs or storage ids
+  externalId?: string; // optional external system id
+}
+
 export interface IBooking extends Document {
   clientId: Types.ObjectId;
   businessId: Types.ObjectId;
@@ -26,6 +48,10 @@ export interface IBooking extends Document {
   metadata?: Record<string, any>;
   location?: ILocation; // nested location with floor & note
   rejectionReason?: string; // optional: only valid when status === 'rejected'
+  // NEW fields for tracking
+  tracking?: string; // current label
+  trackingMessage?: string; // convenience message
+  trackingHistory?: ITrackingHistoryEntry[]; // historical events
   createdAt: Date;
   updatedAt: Date;
 }
@@ -39,6 +65,32 @@ const locationSchema = new Schema<ILocation>(
     note: { type: String, required: false, trim: true },  // optional
   },
   { _id: false } // prevents creating a separate _id for the subdocument
+);
+
+// trackingHistory subdocument schema
+const trackingHistorySchema = new Schema(
+  {
+    status: { type: String, required: true, trim: true }, // human readable status
+    message: { type: String, trim: true, default: "" },
+    actorId: { type: Schema.Types.ObjectId, ref: "User", required: false },
+    actorType: { type: String, required: false }, // e.g. provider, driver, system
+    actorName: { type: String, required: false, trim: true },
+    timestamp: { type: Date, required: true, default: () => new Date() },
+    location: {
+      latitude: { type: Number, required: false },
+      longitude: { type: Number, required: false },
+      address: { type: String, required: false, trim: true },
+    },
+    meta: { type: Schema.Types.Mixed, required: false },
+    notify: {
+      push: { type: Boolean, default: false },
+      sms: { type: Boolean, default: false },
+      email: { type: Boolean, default: false },
+    },
+    photos: [{ type: String }],
+    externalId: { type: String, required: false, trim: true },
+  },
+  { _id: false }
 );
 
 const bookingSchema = new Schema<IBooking>(
@@ -73,8 +125,13 @@ const bookingSchema = new Schema<IBooking>(
 
     location: locationSchema, // embedded location object (address, lat, lng, floor, note)
 
-    // NEW: optional rejection reason (only meaningful when status === 'rejected')
+    // optional rejection reason (only meaningful when status === 'rejected')
     rejectionReason: { type: String, trim: true, required: false },
+
+    // --- TRACKING FIELDS ---
+    tracking: { type: String, required: false, trim: true, index: true }, // current short label
+    trackingMessage: { type: String, required: false, trim: true }, // convenience message
+    trackingHistory: { type: [trackingHistorySchema], default: [] }, // historical tracking entries
   },
   {
     timestamps: true,
@@ -85,11 +142,14 @@ const bookingSchema = new Schema<IBooking>(
 bookingSchema.index({ clientId: 1, createdAt: -1 });
 bookingSchema.index({ businessId: 1, scheduledAt: -1 });
 bookingSchema.index({ status: 1 });
-// optional index if you plan to query by rejectionReason:
-// bookingSchema.index({ rejectionReason: 1 });
+bookingSchema.index({ tracking: 1 });
+// index timestamp in embedded history for range queries (works as a multikey index)
+bookingSchema.index({ "trackingHistory.timestamp": -1 });
 
-// Basic validation
+// Basic validation and invariants
 bookingSchema.pre("validate", function (next) {
+  // `this` is a Booking document
+  // required core fields
   if (!this.clientId) return next(new Error("clientId is required"));
   if (!this.businessId) return next(new Error("businessId is required"));
   if (!this.serviceTitle || this.serviceTitle.trim().length === 0) return next(new Error("serviceTitle is required"));
@@ -110,7 +170,45 @@ bookingSchema.pre("validate", function (next) {
     return next(new Error("rejectionReason may only be set when status is 'rejected'"));
   }
 
+  // Validate trackingHistory entries if present
+  if (Array.isArray(this.trackingHistory)) {
+    for (const entry of this.trackingHistory) {
+      if (!entry || typeof entry !== "object") {
+        return next(new Error("trackingHistory entries must be objects"));
+      }
+      if (!entry.status || String(entry.status).trim().length === 0) {
+        return next(new Error("Each trackingHistory entry must include a non-empty 'status'"));
+      }
+      if (!entry.timestamp || !(entry.timestamp instanceof Date) && isNaN(new Date(entry.timestamp).getTime())) {
+        return next(new Error("Each trackingHistory entry must include a valid 'timestamp'"));
+      }
+      // Optionally enforce message length
+      if (entry.message && String(entry.message).length > 1000) {
+        return next(new Error("trackingHistory.message exceeds maximum length (1000)"));
+      }
+    }
+  }
+
   next();
 });
+
+/*
+ * Optional helper: When you accept a booking you may want to automatically push
+ * an initial trackingHistory entry. You can implement this in your accept route
+ * or here as a helper method.
+ *
+ * Example (not activated automatically):
+ *
+ * bookingSchema.methods.pushTracking = function (entry) {
+ *   this.trackingHistory = this.trackingHistory || [];
+ *   this.trackingHistory.push(entry);
+ *   this.tracking = entry.status;
+ *   this.trackingMessage = entry.message || "";
+ *   return this.save();
+ * };
+ *
+ * Retention note: trackingHistory can grow. Consider capping (e.g. store last N entries)
+ * or archiving older entries to a separate collection if you expect many updates.
+ */
 
 export default mongoose.model<IBooking>("Booking", bookingSchema);

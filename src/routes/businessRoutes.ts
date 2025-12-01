@@ -1009,33 +1009,20 @@ router.get("/bookings/today", async (req: Request, res: Response) => {
       .lean()
       .exec();
 
-    // Convert each booking's scheduledAt to requested timezone (e.g. Asia/Manila)
     const bookingsWithFormatted = bookings.map((b) => {
-      const rawDate = b.scheduledAt ? new Date(b.scheduledAt) : null;
-      let dtInZone = null;
+  const rawDate = b.scheduledAt ? new Date(b.scheduledAt) : null;
+  let dtInZone = null;
 
-      if (rawDate) {
-        // Interpret stored JS Date (UTC instant) and represent it in the requested zone
-        dtInZone = DateTime.fromJSDate(rawDate).setZone(tz);
-      }
+  if (rawDate) {
+    // Interpret rawDate as UTC, then convert to requested timezone
+    dtInZone = DateTime.fromJSDate(rawDate, { zone: 'utc' }).setZone(tz);
+  }
 
-      const scheduledAtFormatted = dtInZone
-        ? `${dtInZone.toLocaleString({ month: "long", day: "numeric", year: "numeric" })} at ${dtInZone.toLocaleString({
-            hour: "numeric",
-            minute: "2-digit",
-            hour12: true,
-          })}`
-        : null;
+  return {
+    ...b,
+  };
+});
 
-      // ISO string with offset (e.g. 2025-11-06T10:00:00+08:00)
-      const scheduledAtLocalIso = dtInZone ? dtInZone.toISO() : null;
-
-      return {
-        ...b,
-        scheduledAtFormatted,
-        scheduledAtLocalIso,
-      };
-    });
 
     return res.status(200).json({
       message: "Bookings for today",

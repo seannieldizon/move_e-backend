@@ -9,6 +9,123 @@ import Location from "../models/location";
 
 const router = Router();
 
+// --- Helper: robust FCM send with multiple SDK compat fallbacks ---
+async function sendPushToTokens(
+  tokens: string[],
+  messagingPayload: { title: string; body: string; data?: Record<string, string> },
+  options?: { androidChannelId?: string; apnsCategory?: string }
+) {
+  const messaging = (admin as any)?.messaging?.();
+  if (!messaging) {
+    return { note: "Firebase messaging not available on server." };
+  }
+
+  const { title, body, data } = messagingPayload;
+  const multicastMessage: any = {
+    tokens,
+    notification: { title, body },
+    data: data ?? {},
+    android: {
+      priority: "high",
+      notification: {
+        channelId: options?.androidChannelId ?? "bookings",
+        clickAction: "FLUTTER_NOTIFICATION_CLICK",
+        sound: "default",
+      },
+    },
+    apns: {
+      headers: { "apns-priority": "10" },
+      payload: {
+        aps: {
+          alert: { title, body },
+          sound: "default",
+          category: options?.apnsCategory ?? "BOOKING_UPDATE",
+        },
+      },
+    },
+  };
+
+  const legacyPayload: any = {
+    notification: { title, body },
+    data: data ?? {},
+    android: {
+      priority: "high",
+      notification: {
+        channelId: options?.androidChannelId ?? "bookings",
+        click_action: "FLUTTER_NOTIFICATION_CLICK",
+      },
+    },
+    apns: {
+      headers: { "apns-priority": "10" },
+      payload: {
+        aps: {
+          alert: { title, body },
+          sound: "default",
+          category: options?.apnsCategory ?? "BOOKING_UPDATE",
+        },
+      },
+    },
+  };
+
+  const summary: any = { successCount: 0, failureCount: 0, responses: [] as any[] };
+  const failedTokens: string[] = [];
+
+  try {
+    if (typeof messaging.sendEachForMulticast === "function") {
+      const r = await messaging.sendEachForMulticast(multicastMessage);
+      summary.successCount = r.successCount ?? 0;
+      summary.failureCount = r.failureCount ?? 0;
+      (r.responses ?? []).forEach((resp: any, i: number) => {
+        summary.responses.push({ success: !!resp.success, error: resp.error ? String(resp.error) : undefined });
+        if (!resp.success) {
+          const code = resp.error?.code ?? String(resp.error);
+          if (code === "messaging/registration-token-not-registered" || code === "messaging/invalid-registration-token") {
+            failedTokens.push(tokens[i]);
+          }
+        }
+      });
+    } else if (typeof messaging.sendMulticast === "function") {
+      const r = await messaging.sendMulticast(multicastMessage);
+      summary.successCount = r.successCount ?? 0;
+      summary.failureCount = r.failureCount ?? 0;
+      (r.responses ?? []).forEach((resp: any, i: number) => {
+        summary.responses.push({ success: !!resp.success, error: resp.error ? String(resp.error) : undefined });
+        if (!resp.success) {
+          const code = resp.error?.code ?? String(resp.error);
+          if (code === "messaging/registration-token-not-registered" || code === "messaging/invalid-registration-token") {
+            failedTokens.push(tokens[i]);
+          }
+        }
+      });
+    } else if (typeof messaging.sendToDevice === "function") {
+      const r = await messaging.sendToDevice(tokens, legacyPayload);
+      const results = r.results ?? r.responses ?? r;
+      let s = 0, f = 0;
+      (results ?? []).forEach((res: any, i: number) => {
+        if (res && res.error) {
+          f++;
+          const code = res.error.code ?? String(res.error);
+          summary.responses.push({ success: false, error: code });
+          if (code === "messaging/registration-token-not-registered" || code === "messaging/invalid-registration-token") {
+            failedTokens.push(tokens[i]);
+          }
+        } else {
+          s++;
+          summary.responses.push({ success: true });
+        }
+      });
+      summary.successCount = s;
+      summary.failureCount = f;
+    } else {
+      return { note: "No supported send method on admin.messaging()" };
+    }
+
+    return { summary, failedTokens };
+  } catch (e) {
+    return { error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
 // parse "HH:mm" or "HH:mm:ss" into minutes since midnight, or null if invalid
 function parseTimeToMinutes(t?: string | null): number | null {
   if (!t || typeof t !== "string") return null;
@@ -286,116 +403,21 @@ router.post("/add-bookings", async (req: Request, res: Response) => {
           scheduledAt: bookingDoc.scheduledAt.toISOString(),
         };
 
-        const multicastMessage: any = {
-          tokens,
-          notification: { title, body },
-          data: dataPayload,
-          android: {
-            priority: "high",
-            notification: {
-              channelId: "bookings",
-              clickAction: "FLUTTER_NOTIFICATION_CLICK",
-              sound: "default",
-            },
-          },
-          apns: {
-            headers: { "apns-priority": "10" },
-            payload: {
-              aps: {
-                alert: { title, body },
-                sound: "default",
-                category: "NEW_BOOKING",
-              },
-            },
-          },
-        };
+        // Use helper to send
+        const sendResult = await sendPushToTokens(tokens, { title, body, data: dataPayload }, { androidChannelId: "bookings", apnsCategory: "NEW_BOOKING" });
 
-        const legacyPayload: any = {
-          notification: { title, body },
-          data: dataPayload,
-          android: {
-            priority: "high",
-            notification: {
-              channelId: "bookings",
-              click_action: "FLUTTER_NOTIFICATION_CLICK",
-            },
-          },
-          apns: {
-            headers: { "apns-priority": "10" },
-            payload: {
-              aps: {
-                alert: { title, body },
-                sound: "default",
-                category: "NEW_BOOKING",
-              },
-            },
-          },
-        };
-
-        const messaging = (admin as any)?.messaging?.();
-        notificationResult = { successCount: 0, failureCount: 0, responses: [] as any[] };
-        const failedTokens: string[] = [];
-
-        if (messaging && typeof messaging.sendEachForMulticast === "function") {
-          const sendRes = await messaging.sendEachForMulticast(multicastMessage);
-          notificationResult.successCount = sendRes.successCount ?? 0;
-          notificationResult.failureCount = sendRes.failureCount ?? 0;
-
-          (sendRes.responses ?? []).forEach((r: any, i: number) => {
-            notificationResult.responses.push({ success: !!r.success, error: r.error ? String(r.error) : undefined });
-            if (!r.success) {
-              const code = r.error?.code ?? String(r.error);
-              if (code === "messaging/registration-token-not-registered" || code === "messaging/invalid-registration-token") {
-                failedTokens.push(tokens[i]);
-              }
-            }
-          });
-        } else if (messaging && typeof messaging.sendMulticast === "function") {
-          const sendRes = await messaging.sendMulticast(multicastMessage);
-          notificationResult.successCount = sendRes.successCount ?? 0;
-          notificationResult.failureCount = sendRes.failureCount ?? 0;
-          (sendRes.responses ?? []).forEach((r: any, i: number) => {
-            notificationResult.responses.push({ success: !!r.success, error: r.error ? String(r.error) : undefined });
-            if (!r.success) {
-              const code = r.error?.code ?? String(r.error);
-              if (code === "messaging/registration-token-not-registered" || code === "messaging/invalid-registration-token") {
-                failedTokens.push(tokens[i]);
-              }
-            }
-          });
-        } else if (messaging && typeof messaging.sendToDevice === "function") {
-          const sendRes = await messaging.sendToDevice(tokens, legacyPayload);
-          const results = sendRes.results ?? sendRes.responses ?? sendRes;
-          let successCount = 0;
-          let failureCount = 0;
-          (results ?? []).forEach((r: any, i: number) => {
-            if (r && r.error) {
-              failureCount++;
-              const code = r.error.code ?? String(r.error);
-              notificationResult.responses.push({ success: false, error: code });
-              if (code === "messaging/registration-token-not-registered" || code === "messaging/invalid-registration-token") {
-                failedTokens.push(tokens[i]);
-              }
-            } else {
-              successCount++;
-              notificationResult.responses.push({ success: true });
-            }
-          });
-          notificationResult.successCount = successCount;
-          notificationResult.failureCount = failureCount;
+        if ((sendResult as any).error) {
+          notificationResult = { error: (sendResult as any).error };
         } else {
-          // Messaging not available or admin not initialized
-          notificationResult = { note: "Firebase messaging not available on server." };
-        }
-
-        // Remove invalid tokens from businessDoc.fcmTokens
-        if (failedTokens.length > 0) {
-          try {
-            await BusinessInfo.updateOne({ _id: businessId }, { $pull: { fcmTokens: { $in: failedTokens } } }).exec();
-            notificationResult.removedInvalidTokens = failedTokens;
-          } catch (e) {
-            console.warn("Failed to remove invalid tokens:", e);
-            notificationResult.removeError = String(e);
+          notificationResult = (sendResult as any).summary ?? sendResult;
+          if (Array.isArray((sendResult as any).failedTokens) && (sendResult as any).failedTokens.length > 0) {
+            try {
+              await BusinessInfo.updateOne({ _id: businessId }, { $pull: { fcmTokens: { $in: (sendResult as any).failedTokens } } }).exec();
+              notificationResult.removedInvalidTokens = (sendResult as any).failedTokens;
+            } catch (e) {
+              console.warn("Failed to remove invalid tokens:", e);
+              notificationResult.removeError = String(e);
+            }
           }
         }
       }
@@ -415,7 +437,6 @@ router.post("/add-bookings", async (req: Request, res: Response) => {
     return res.status(500).json({ message: "Server error.", error: (err as Error).message });
   }
 });
-
 
 router.post("/:id/cancel-booking", async (req: Request, res: Response) => {
   try {
@@ -446,122 +467,159 @@ router.post("/:id/cancel-booking", async (req: Request, res: Response) => {
       return res.status(409).json({ success: false, message: `Cannot cancel booking with status '${booking.status}'` });
     }
 
-    // Update status
+    // Update status + push a tracking entry
     booking.status = "cancelled";
     booking.updatedAt = new Date();
+    if (!Array.isArray((booking as any).trackingHistory)) (booking as any).trackingHistory = [];
+    (booking as any).trackingHistory.push({
+      status: "Cancelled",
+      message: "Booking cancelled by client",
+      timestamp: new Date(),
+    });
 
     await booking.save();
 
     // Optionally populate to return richer object (client, business, service)
-    const populated = await Booking.findById(booking._id)
-      .populate({ path: "clientId", select: "firstName lastName email phone", model: User })
-      .populate({ path: "businessId", select: "businessName location", model: BusinessInfo })
+    const populated = (await Booking.findById(booking._id)
+      .populate({ path: "clientId", select: "firstName lastName email phone fcmToken fcmTokens", model: User })
+      .populate({ path: "businessId", select: "businessName location fcmTokens clientId", model: BusinessInfo })
       .populate({ path: "serviceId", select: "title price duration", model: ServiceOffered })
       .lean()
-      .exec();
+      .exec()) as any;
 
-    return res.status(200).json({ success: true, message: "Booking cancelled", booking: populated });
+    // Prepare notification objects and tokens
+    let notification: any = {};
+    try {
+      // Use either booking.serviceTitle (explicit stored string) or populated.serviceId.title (populated doc)
+      const serviceTitle = (booking as any).serviceTitle ?? (populated?.serviceId ? (populated.serviceId as any).title : "your booking");
+
+      const formattedDateTime = booking.scheduledAt
+        ? new Date(booking.scheduledAt).toLocaleString("en-US", {
+            month: "long",
+            day: "numeric",
+            year: "numeric",
+            hour: "numeric",
+            minute: "2-digit",
+            hour12: true,
+          })
+        : "";
+
+      // Build client's full name (prefer populated client fields, fallback to booking.contactName)
+      let clientFullName = "the client";
+      const clientDoc = populated?.clientId ?? null;
+      if (clientDoc) {
+        const fn = (clientDoc.firstName ?? "").toString().trim();
+        const ln = (clientDoc.lastName ?? "").toString().trim();
+        if (fn || ln) {
+          clientFullName = `${fn}${fn && ln ? " " : ""}${ln}`.trim();
+        }
+      }
+      if ((clientFullName === "the client" || clientFullName.trim() === "") && booking.contactName) {
+        const contact = (booking as any).contactName ?? "";
+        if (typeof contact === "string" && contact.trim().length > 0) clientFullName = contact.trim();
+      }
+
+      // Notify business/provider first (similar to add-bookings)
+      const businessDoc = (populated as any)?.businessId ?? null;
+      const providerTokens: string[] = [];
+      if (businessDoc) {
+        if (Array.isArray(businessDoc.fcmTokens)) {
+          for (const t of businessDoc.fcmTokens) {
+            if (typeof t === "string" && t.trim().length > 0) providerTokens.push(t);
+          }
+        }
+        // fallback: try to fetch owner user fcmToken if the business doc references clientId
+        if (providerTokens.length === 0 && businessDoc.clientId) {
+          try {
+            const owner = await User.findById(businessDoc.clientId).select("fcmToken fcmTokens").lean().exec() as any;
+            if (owner) {
+              if (Array.isArray(owner.fcmTokens)) {
+                for (const t of owner.fcmTokens) {
+                  if (typeof t === "string" && t.trim().length > 0) providerTokens.push(t);
+                }
+              }
+              if ((!Array.isArray(owner.fcmTokens) || providerTokens.length === 0) && typeof owner.fcmToken === "string" && owner.fcmToken.trim().length > 0) {
+                providerTokens.push(owner.fcmToken);
+              }
+            }
+          } catch (e) {
+            console.warn("Failed to lookup business owner for tokens:", e);
+          }
+        }
+      }
+
+      const providerTitle = "Booking cancelled";
+      // use client's full name here
+      const providerBody = `${serviceTitle} scheduled on ${formattedDateTime} was cancelled by ${clientFullName}.`;
+
+      if (providerTokens.length > 0) {
+        const provResult = await sendPushToTokens(
+          providerTokens,
+          { title: providerTitle, body: providerBody, data: { bookingId: String(booking._id), type: "booking_cancelled" } },
+          { androidChannelId: "bookings", apnsCategory: "BOOKING_CANCELLED" }
+        );
+        notification.provider = provResult;
+        if (Array.isArray((provResult as any).failedTokens) && (provResult as any).failedTokens.length > 0 && businessDoc && businessDoc._id) {
+          try {
+            await BusinessInfo.updateOne({ _id: businessDoc._id }, { $pull: { fcmTokens: { $in: (provResult as any).failedTokens } } }).exec();
+            notification.providerPruned = (provResult as any).failedTokens;
+          } catch (e) {
+            console.warn("Failed to prune invalid business tokens", e);
+          }
+        }
+      } else {
+        notification.provider = { note: "No fcm tokens found for business/provider." };
+      }
+
+      // Notify client (so the client device also receives a push if they have multiple devices)
+      const clientTokens: string[] = [];
+      if (clientDoc) {
+        if (Array.isArray(clientDoc.fcmTokens)) {
+          for (const t of clientDoc.fcmTokens) {
+            if (typeof t === "string" && t.trim().length > 0) clientTokens.push(t);
+          }
+        }
+        if ((!Array.isArray(clientDoc.fcmTokens) || clientTokens.length === 0) && typeof clientDoc.fcmToken === "string" && clientDoc.fcmToken.trim().length > 0) {
+          clientTokens.push(clientDoc.fcmToken);
+        }
+      }
+
+      const clientTitle = "Booking cancelled";
+      const clientBody = `${serviceTitle} scheduled on ${formattedDateTime} has been cancelled.`;
+
+      if (clientTokens.length > 0) {
+        const clientResult = await sendPushToTokens(
+          clientTokens,
+          { title: clientTitle, body: clientBody, data: { bookingId: String(booking._id), type: "booking_cancelled" } },
+          { androidChannelId: "bookings", apnsCategory: "BOOKING_CANCELLED" }
+        );
+        notification.client = clientResult;
+        if (Array.isArray((clientResult as any).failedTokens) && (clientResult as any).failedTokens.length > 0 && clientDoc && clientDoc._id) {
+          try {
+            if (Array.isArray(clientDoc.fcmTokens)) {
+              await User.updateOne({ _id: clientDoc._id }, { $pull: { fcmTokens: { $in: (clientResult as any).failedTokens } } }).exec();
+              notification.clientPruned = (clientResult as any).failedTokens;
+            } else if (clientDoc.fcmToken && (clientResult as any).failedTokens.includes(clientDoc.fcmToken)) {
+              await User.updateOne({ _id: clientDoc._id }, { $unset: { fcmToken: 1 } }).exec();
+              notification.clientPruned = (clientResult as any).failedTokens;
+            }
+          } catch (e) {
+            console.warn("Failed to prune invalid client tokens", e);
+          }
+        }
+      } else {
+        notification.client = { note: "No fcm tokens found for client." };
+      }
+    } catch (notifErr) {
+      console.error("Cancel booking notification failed:", notifErr);
+      notification = notification || {};
+      notification.error = notifErr instanceof Error ? notifErr.message : String(notifErr);
+    }
+
+    return res.status(200).json({ success: true, message: "Booking cancelled", booking: populated, notification });
   } catch (err) {
     console.error("POST /bookings/:id/cancel error:", err);
     return res.status(500).json({ success: false, message: "Server error", error: (err as Error).message });
-  }
-});
-
-router.get("/by-business/:businessId", async (req: Request, res: Response) => {
-  try {
-    const { businessId } = req.params;
-    const { page = "1", limit = "20", status, dateFrom, dateTo } = req.query;
-
-    if (!businessId || !mongoose.isValidObjectId(businessId)) {
-      return res
-        .status(400)
-        .json({ message: "Invalid or missing businessId." });
-    }
-
-    // Optional: verify business exists (we return its operatingSchedule)
-    const businessExists = await BusinessInfo.findById(businessId)
-      .select("_id operatingSchedule businessName")
-      .lean()
-      .exec();
-    if (!businessExists) {
-      return res.status(404).json({ message: "Business not found." });
-    }
-
-    const pg = Math.max(parseInt(String(page), 10) || 1, 1);
-    const lim = Math.min(Math.max(parseInt(String(limit), 10) || 20, 1), 200);
-
-    const qry: any = { businessId: new mongoose.Types.ObjectId(businessId) };
-
-    // status filter (accept comma-separated)
-    if (status) {
-      const statuses = String(status)
-        .split(",")
-        .map((s) => s.trim())
-        .filter(Boolean);
-      if (statuses.length === 1) {
-        qry.status = statuses[0];
-      } else if (statuses.length > 1) {
-        qry.status = { $in: statuses };
-      }
-    }
-
-    // date range filter on scheduledAt
-    if (dateFrom || dateTo) {
-      qry.scheduledAt = {};
-      if (dateFrom) {
-        const df = new Date(String(dateFrom));
-        if (!Number.isNaN(df.getTime())) qry.scheduledAt.$gte = df;
-      }
-      if (dateTo) {
-        const dt = new Date(String(dateTo));
-        if (!Number.isNaN(dt.getTime())) qry.scheduledAt.$lte = dt;
-      }
-      if (Object.keys(qry.scheduledAt).length === 0) delete qry.scheduledAt;
-    }
-
-    const total = await Booking.countDocuments(qry).exec();
-
-    const bookings = await Booking.find(qry)
-      .sort({ scheduledAt: -1, createdAt: -1 })
-      .skip((pg - 1) * lim)
-      .limit(lim)
-      .populate({
-        path: "clientId",
-        select: "firstName lastName email phone",
-        model: User,
-      })
-      .populate({
-        path: "serviceId",
-        select: "title price duration",
-        model: ServiceOffered,
-      })
-      .lean()
-      .exec();
-
-    // 🔹 Convert UTC time → Manila time (UTC+8)
-    const manilaOffset = 8 * 60 * 60 * 1000; // 8 hours in ms
-    const converted = bookings.map((b) => {
-      if (b.scheduledAt) {
-        const utcDate = new Date(b.scheduledAt);
-        const manilaDate = new Date(utcDate.getTime() + manilaOffset);
-        return { ...b, scheduledAt: manilaDate };
-      }
-      return b;
-    });
-
-    return res.status(200).json({
-      message: "Bookings fetched.",
-      total,
-      page: pg,
-      limit: lim,
-      business: businessExists,
-      bookings: converted, // ⬅️ use converted version
-    });
-  } catch (err) {
-    console.error("GET /bookings/by-business error:", err);
-    return res
-      .status(500)
-      .json({ message: "Server error.", error: (err as Error).message });
   }
 });
 
@@ -787,6 +845,555 @@ router.post("/reject/:id", async (req: Request, res: Response) => {
   }
 });
 
+// POST /:id/accept
+router.post("/:id/accept", async (req: Request, res: Response) => {
+  try {
+    const bookingId = req.params.id;
+    const { actorId } = req.body ?? {}; // optional: who performed the accept (business user)
+
+    if (!bookingId || !mongoose.isValidObjectId(bookingId)) {
+      return res.status(400).json({ success: false, message: "Invalid booking id" });
+    }
+
+    // find booking
+    const booking = await Booking.findById(bookingId).exec();
+    if (!booking) {
+      return res.status(404).json({ success: false, message: "Booking not found" });
+    }
+
+    const currentStatus = (booking.status ?? "").toString().toLowerCase();
+    // cannot accept if already in final states
+    if (["cancelled", "completed", "rejected"].includes(currentStatus)) {
+      return res.status(409).json({
+        success: false,
+        message: `Cannot accept booking with status '${booking.status}'`,
+      });
+    }
+    if (currentStatus === "confirmed") {
+      // idempotent response for already-confirmed bookings
+      const populatedAlready = (await Booking.findById(booking._id)
+        .populate({ path: "clientId", select: "firstName lastName email phone fcmToken fcmTokens", model: User })
+        .populate({ path: "businessId", select: "businessName location", model: BusinessInfo })
+        .populate({ path: "serviceId", select: "title price duration", model: ServiceOffered })
+        .lean()
+        .exec()) as any;
+      return res.status(200).json({ success: true, message: "Booking already confirmed", booking: populatedAlready });
+    }
+
+    // update booking
+    booking.status = "confirmed";
+    // remove any previous rejectionReason if present
+    if ((booking as any).rejectionReason) (booking as any).rejectionReason = undefined;
+    booking.updatedAt = new Date();
+
+    await booking.save();
+
+    // populate to return richer object
+    const populated = (await Booking.findById(booking._id)
+      .populate({ path: "clientId", select: "firstName lastName email phone fcmToken fcmTokens", model: User })
+      .populate({ path: "businessId", select: "businessName location", model: BusinessInfo })
+      .populate({ path: "serviceId", select: "title price duration", model: ServiceOffered })
+      .lean()
+      .exec()) as any;
+
+    // Try to send notification to client (best-effort)
+    let notificationResult: any = null;
+    try {
+      const clientDoc = populated?.clientId as any | null;
+      const tokens: string[] = [];
+
+      if (clientDoc) {
+        if (Array.isArray(clientDoc.fcmTokens)) {
+          for (const t of clientDoc.fcmTokens) {
+            if (typeof t === "string" && t.trim()) tokens.push(t);
+          }
+        }
+        if (!clientDoc.fcmTokens && typeof clientDoc.fcmToken === "string" && clientDoc.fcmToken.trim()) {
+          tokens.push(clientDoc.fcmToken);
+        }
+      }
+
+      if (tokens.length === 0) {
+        notificationResult = { note: "No fcm tokens found for client." };
+      } else {
+        const title = "Booking confirmed";
+        const formattedDateTime = booking.scheduledAt
+          ? new Date(booking.scheduledAt).toLocaleString("en-US", {
+              month: "long",
+              day: "numeric",
+              year: "numeric",
+              hour: "numeric",
+              minute: "2-digit",
+              hour12: true,
+            })
+          : "";
+        const serviceTitle = (booking as any).serviceTitle ?? (populated?.serviceId?.title ?? "your booking");
+        const body = `${serviceTitle} scheduled on ${formattedDateTime} has been confirmed.`;
+
+        const dataPayload: Record<string, string> = {
+          bookingId: String(booking._id),
+          type: "booking_confirmed",
+        };
+
+        const multicastMessage: any = {
+          tokens,
+          notification: { title, body },
+          data: dataPayload,
+          android: {
+            priority: "high",
+            notification: {
+              channelId: "bookings",
+              clickAction: "FLUTTER_NOTIFICATION_CLICK",
+              sound: "default",
+            },
+          },
+          apns: {
+            headers: { "apns-priority": "10" },
+            payload: {
+              aps: {
+                alert: { title, body },
+                sound: "default",
+                category: "BOOKING_CONFIRMED",
+              },
+            },
+          },
+        };
+
+        const legacyPayload: any = {
+          notification: { title, body },
+          data: dataPayload,
+          android: {
+            priority: "high",
+            notification: {
+              channelId: "bookings",
+              click_action: "FLUTTER_NOTIFICATION_CLICK",
+            },
+          },
+          apns: {
+            headers: { "apns-priority": "10" },
+            payload: {
+              aps: {
+                alert: { title, body },
+                sound: "default",
+                category: "BOOKING_CONFIRMED",
+              },
+            },
+          },
+        };
+
+        const messaging = (admin as any)?.messaging?.();
+        notificationResult = { successCount: 0, failureCount: 0, responses: [] as any[] };
+        const failedTokens: string[] = [];
+
+        if (messaging && typeof messaging.sendEachForMulticast === "function") {
+          const sendRes = await messaging.sendEachForMulticast(multicastMessage);
+          notificationResult.successCount = sendRes.successCount ?? 0;
+          notificationResult.failureCount = sendRes.failureCount ?? 0;
+          (sendRes.responses ?? []).forEach((r: any, i: number) => {
+            notificationResult.responses.push({ success: !!r.success, error: r.error ? String(r.error) : undefined });
+            if (!r.success) {
+              const code = r.error?.code ?? String(r.error);
+              if (code === "messaging/registration-token-not-registered" || code === "messaging/invalid-registration-token") {
+                failedTokens.push(tokens[i]);
+              }
+            }
+          });
+        } else if (messaging && typeof messaging.sendMulticast === "function") {
+          const sendRes = await messaging.sendMulticast(multicastMessage);
+          notificationResult.successCount = sendRes.successCount ?? 0;
+          notificationResult.failureCount = sendRes.failureCount ?? 0;
+          (sendRes.responses ?? []).forEach((r: any, i: number) => {
+            notificationResult.responses.push({ success: !!r.success, error: r.error ? String(r.error) : undefined });
+            if (!r.success) {
+              const code = r.error?.code ?? String(r.error);
+              if (code === "messaging/registration-token-not-registered" || code === "messaging/invalid-registration-token") {
+                failedTokens.push(tokens[i]);
+              }
+            }
+          });
+        } else if (messaging && typeof messaging.sendToDevice === "function") {
+          const sendRes = await messaging.sendToDevice(tokens, legacyPayload);
+          const results = sendRes.results ?? sendRes.responses ?? sendRes;
+          let successCount = 0;
+          let failureCount = 0;
+          (results ?? []).forEach((r: any, i: number) => {
+            if (r && r.error) {
+              failureCount++;
+              const code = r.error.code ?? String(r.error);
+              notificationResult.responses.push({ success: false, error: code });
+              if (code === "messaging/registration-token-not-registered" || code === "messaging/invalid-registration-token") {
+                failedTokens.push(tokens[i]);
+              }
+            } else {
+              successCount++;
+              notificationResult.responses.push({ success: true });
+            }
+          });
+          notificationResult.successCount = successCount;
+          notificationResult.failureCount = failureCount;
+        } else {
+          notificationResult = { note: "Firebase messaging not available on server." };
+        }
+
+        // prune invalid tokens from client doc if applicable
+        if (failedTokens.length > 0 && clientDoc && clientDoc._id) {
+          try {
+            if (Array.isArray((clientDoc as any).fcmTokens)) {
+              await User.updateOne({ _id: clientDoc._id }, { $pull: { fcmTokens: { $in: failedTokens } } }).exec();
+              notificationResult.removedInvalidTokens = failedTokens;
+            } else if ((clientDoc as any).fcmToken && failedTokens.includes((clientDoc as any).fcmToken)) {
+              await User.updateOne({ _id: clientDoc._id }, { $unset: { fcmToken: 1 } }).exec();
+              notificationResult.removedInvalidTokens = failedTokens;
+            }
+          } catch (e) {
+            notificationResult.removeError = String(e);
+          }
+        }
+      }
+    } catch (notifErr) {
+      console.error("Failed to send confirmation notification:", notifErr);
+      notificationResult = { error: notifErr instanceof Error ? notifErr.message : String(notifErr) };
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: "Booking confirmed.",
+      booking: populated,
+      notification: notificationResult,
+    });
+  } catch (err) {
+    console.error("POST /:id/accept error:", err);
+    return res.status(500).json({ success: false, message: "Server error", error: (err as Error).message });
+  }
+});
+
+// POST /:id/track
+router.post("/:id/track", async (req: Request, res: Response) => {
+  try {
+    const bookingId = req.params.id;
+    const { status, message, actorId } = req.body ?? {};
+
+    if (!bookingId || !mongoose.isValidObjectId(bookingId)) {
+      return res.status(400).json({ success: false, message: "Invalid booking id" });
+    }
+
+    if (!status || typeof status !== "string" || status.trim().length === 0) {
+      return res.status(400).json({ success: false, message: "Missing 'status' in request body." });
+    }
+
+    // normalize status label (e.g., "Preparing", "On the way", "Arrived", "Completed")
+    const statusLabel = String(status).trim();
+    const statusLower = statusLabel.toLowerCase();
+
+    // find booking
+    const booking = await Booking.findById(bookingId).exec();
+    if (!booking) {
+      return res.status(404).json({ success: false, message: "Booking not found" });
+    }
+
+    const currentStatus = (booking.status ?? "").toString().toLowerCase();
+    // disallow updating tracking for bookings in final states
+    if (["cancelled", "rejected"].includes(currentStatus)) {
+      return res.status(409).json({
+        success: false,
+        message: `Cannot update tracking for booking with status '${booking.status}'`,
+      });
+    }
+    if (currentStatus === "completed") {
+      return res.status(409).json({
+        success: false,
+        message: "Booking already completed; tracking cannot be updated.",
+      });
+    }
+
+    // Build tracking entry
+    const now = new Date();
+    const trackingEntry: any = {
+      status: statusLabel,
+      message: typeof message === "string" ? message.trim() : "",
+      actorId: actorId ? actorId : undefined,
+      timestamp: now,
+    };
+
+    // update booking fields
+    (booking as any).tracking = statusLabel;
+    (booking as any).trackingMessage = typeof message === "string" ? message.trim() : "";
+    // ensure trackingHistory array exists then push
+    if (!Array.isArray((booking as any).trackingHistory)) {
+      (booking as any).trackingHistory = [];
+    }
+    (booking as any).trackingHistory.push(trackingEntry);
+
+    // update overall booking status: completed => completed, else keep/ensure confirmed
+    if (statusLower === "completed") {
+      booking.status = "completed";
+    } else {
+      // keep existing status if it's already 'confirmed', otherwise set to 'confirmed'
+      booking.status = booking.status && booking.status.toString().toLowerCase() === "confirmed" ? booking.status : "confirmed";
+    }
+
+    booking.updatedAt = now;
+
+    await booking.save();
+
+    // populate to return richer object
+    const populated = (await Booking.findById(booking._id)
+      .populate({ path: "clientId", select: "firstName lastName email phone fcmToken fcmTokens", model: User })
+      .populate({ path: "businessId", select: "businessName location", model: BusinessInfo })
+      .populate({ path: "serviceId", select: "title price duration", model: ServiceOffered })
+      .lean()
+      .exec()) as any;
+
+    // Try to send notification to client (best-effort)
+    let notificationResult: any = null;
+    try {
+      const clientDoc = populated?.clientId as any | null;
+      const tokens: string[] = [];
+
+      if (clientDoc) {
+        if (Array.isArray(clientDoc.fcmTokens)) {
+          for (const t of clientDoc.fcmTokens) {
+            if (typeof t === "string" && t.trim()) tokens.push(t);
+          }
+        }
+        if (!clientDoc.fcmTokens && typeof clientDoc.fcmToken === "string" && clientDoc.fcmToken.trim()) {
+          tokens.push(clientDoc.fcmToken);
+        }
+      }
+
+      if (tokens.length === 0) {
+        notificationResult = { note: "No fcm tokens found for client." };
+      } else {
+        const title = `Booking update: ${statusLabel}`;
+        // prefer provided message as body; if not, construct a short message
+        const body = (typeof message === "string" && message.trim().length > 0)
+          ? message.trim()
+          : `${(booking as any).serviceTitle ?? (populated?.serviceId?.title ?? "Your booking")} status updated to ${statusLabel}.`;
+
+        const dataPayload: Record<string, string> = {
+          bookingId: String(booking._id),
+          type: "booking_tracking",
+          trackingStatus: statusLabel,
+        };
+
+        const multicastMessage: any = {
+          tokens,
+          notification: { title, body },
+          data: dataPayload,
+          android: {
+            priority: "high",
+            notification: {
+              channelId: "bookings",
+              clickAction: "FLUTTER_NOTIFICATION_CLICK",
+              sound: "default",
+            },
+          },
+          apns: {
+            headers: { "apns-priority": "10" },
+            payload: {
+              aps: {
+                alert: { title, body },
+                sound: "default",
+                category: "BOOKING_TRACKING",
+              },
+            },
+          },
+        };
+
+        const legacyPayload: any = {
+          notification: { title, body },
+          data: dataPayload,
+          android: {
+            priority: "high",
+            notification: {
+              channelId: "bookings",
+              click_action: "FLUTTER_NOTIFICATION_CLICK",
+            },
+          },
+          apns: {
+            headers: { "apns-priority": "10" },
+            payload: {
+              aps: {
+                alert: { title, body },
+                sound: "default",
+                category: "BOOKING_TRACKING",
+              },
+            },
+          },
+        };
+
+        const messaging = (admin as any)?.messaging?.();
+        notificationResult = { successCount: 0, failureCount: 0, responses: [] as any[] };
+        const failedTokens: string[] = [];
+
+        if (messaging && typeof messaging.sendEachForMulticast === "function") {
+          const sendRes = await messaging.sendEachForMulticast(multicastMessage);
+          notificationResult.successCount = sendRes.successCount ?? 0;
+          notificationResult.failureCount = sendRes.failureCount ?? 0;
+          (sendRes.responses ?? []).forEach((r: any, i: number) => {
+            notificationResult.responses.push({ success: !!r.success, error: r.error ? String(r.error) : undefined });
+            if (!r.success) {
+              const code = r.error?.code ?? String(r.error);
+              if (code === "messaging/registration-token-not-registered" || code === "messaging/invalid-registration-token") {
+                failedTokens.push(tokens[i]);
+              }
+            }
+          });
+        } else if (messaging && typeof messaging.sendMulticast === "function") {
+          const sendRes = await messaging.sendMulticast(multicastMessage);
+          notificationResult.successCount = sendRes.successCount ?? 0;
+          notificationResult.failureCount = sendRes.failureCount ?? 0;
+          (sendRes.responses ?? []).forEach((r: any, i: number) => {
+            notificationResult.responses.push({ success: !!r.success, error: r.error ? String(r.error) : undefined });
+            if (!r.success) {
+              const code = r.error?.code ?? String(r.error);
+              if (code === "messaging/registration-token-not-registered" || code === "messaging/invalid-registration-token") {
+                failedTokens.push(tokens[i]);
+              }
+            }
+          });
+        } else if (messaging && typeof messaging.sendToDevice === "function") {
+          const sendRes = await messaging.sendToDevice(tokens, legacyPayload);
+          const results = sendRes.results ?? sendRes.responses ?? sendRes;
+          let successCount = 0;
+          let failureCount = 0;
+          (results ?? []).forEach((r: any, i: number) => {
+            if (r && r.error) {
+              failureCount++;
+              const code = r.error.code ?? String(r.error);
+              notificationResult.responses.push({ success: false, error: code });
+              if (code === "messaging/registration-token-not-registered" || code === "messaging/invalid-registration-token") {
+                failedTokens.push(tokens[i]);
+              }
+            } else {
+              successCount++;
+              notificationResult.responses.push({ success: true });
+            }
+          });
+          notificationResult.successCount = successCount;
+          notificationResult.failureCount = failureCount;
+        } else {
+          notificationResult = { note: "Firebase messaging not available on server." };
+        }
+
+        // prune invalid tokens from client doc if applicable
+        if (failedTokens.length > 0 && clientDoc && clientDoc._id) {
+          try {
+            if (Array.isArray((clientDoc as any).fcmTokens)) {
+              await User.updateOne({ _id: clientDoc._id }, { $pull: { fcmTokens: { $in: failedTokens } } }).exec();
+              notificationResult.removedInvalidTokens = failedTokens;
+            } else if ((clientDoc as any).fcmToken && failedTokens.includes((clientDoc as any).fcmToken)) {
+              await User.updateOne({ _id: clientDoc._id }, { $unset: { fcmToken: 1 } }).exec();
+              notificationResult.removedInvalidTokens = failedTokens;
+            }
+          } catch (e) {
+            notificationResult.removeError = String(e);
+          }
+        }
+      }
+    } catch (notifErr) {
+      console.error("Failed to send tracking notification:", notifErr);
+      notificationResult = { error: notifErr instanceof Error ? notifErr.message : String(notifErr) };
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: "Tracking updated.",
+      booking: populated,
+      notification: notificationResult,
+    });
+  } catch (err) {
+    console.error("POST /:id/track error:", err);
+    return res.status(500).json({ success: false, message: "Server error", error: (err as Error).message });
+  }
+});
+
+router.get("/by-business/:businessId", async (req: Request, res: Response) => {
+  try {
+    const { businessId } = req.params;
+    const { page = "1", limit = "20", status, dateFrom, dateTo } = req.query;
+
+    if (!businessId || !mongoose.isValidObjectId(businessId)) {
+      return res
+        .status(400)
+        .json({ message: "Invalid or missing businessId." });
+    }
+
+    // Optional: verify business exists (we return its operatingSchedule)
+    const businessExists = await BusinessInfo.findById(businessId)
+      .select("_id operatingSchedule businessName")
+      .lean()
+      .exec();
+    if (!businessExists) {
+      return res.status(404).json({ message: "Business not found." });
+    }
+
+    const pg = Math.max(parseInt(String(page), 10) || 1, 1);
+    const lim = Math.min(Math.max(parseInt(String(limit), 10) || 20, 1), 200);
+
+    const qry: any = { businessId: new mongoose.Types.ObjectId(businessId) };
+
+    // status filter (accept comma-separated)
+    if (status) {
+      const statuses = String(status)
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean);
+      if (statuses.length === 1) {
+        qry.status = statuses[0];
+      } else if (statuses.length > 1) {
+        qry.status = { $in: statuses };
+      }
+    }
+
+    // date range filter on scheduledAt
+    if (dateFrom || dateTo) {
+      qry.scheduledAt = {};
+      if (dateFrom) {
+        const df = new Date(String(dateFrom));
+        if (!Number.isNaN(df.getTime())) qry.scheduledAt.$gte = df;
+      }
+      if (dateTo) {
+        const dt = new Date(String(dateTo));
+        if (!Number.isNaN(dt.getTime())) qry.scheduledAt.$lte = dt;
+      }
+      if (Object.keys(qry.scheduledAt).length === 0) delete qry.scheduledAt;
+    }
+
+    const total = await Booking.countDocuments(qry).exec();
+
+    const bookings = await Booking.find(qry)
+      .sort({ scheduledAt: -1, createdAt: -1 })
+      .skip((pg - 1) * lim)
+      .limit(lim)
+      .populate({
+        path: "clientId",
+        select: "firstName lastName email phone",
+        model: User,
+      })
+      .populate({
+        path: "serviceId",
+        select: "title price duration",
+        model: ServiceOffered,
+      })
+      .lean()
+      .exec();
+
+    return res.status(200).json({
+      message: "Bookings fetched.",
+      total,
+      page: pg,
+      limit: lim,
+      business: businessExists,
+      bookings, // ⬅️ use converted version
+    });
+  } catch (err) {
+    console.error("GET /bookings/by-business error:", err);
+    return res
+      .status(500)
+      .json({ message: "Server error.", error: (err as Error).message });
+  }
+});
 
 router.get("/quickbook", async (req: Request, res: Response) => {
   try {
@@ -942,5 +1549,6 @@ router.get("/quickbook", async (req: Request, res: Response) => {
     return res.status(500).json({ message: "Server error.", error: (err as Error).message });
   }
 });
+
 
 export default router;
