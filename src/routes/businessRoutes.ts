@@ -9,6 +9,7 @@ import ServiceOffered from "../models/services_offered";
 import dotenv from "dotenv";
 import { DateTime } from "luxon";
 import fs from "fs/promises";
+import Review from '../models/review';
 
 const router = Router();
 dotenv.config();
@@ -384,7 +385,7 @@ router.get("/get-verified-businesses", async (req: Request, res: Response) => {
       filter.category = category;
     }
 
-    // Query DB
+    // Query DB for businesses (lean for performance)
     const [total, businesses] = await Promise.all([
       BusinessInfo.countDocuments(filter).exec(),
       BusinessInfo.find(filter)
@@ -395,11 +396,64 @@ router.get("/get-verified-businesses", async (req: Request, res: Response) => {
         .exec(),
     ]);
 
+    // If no businesses returned, short-circuit
+    if (!businesses || businesses.length === 0) {
+      return res.status(200).json({
+        total,
+        page,
+        perPage: limit,
+        businesses: [],
+      });
+    }
+
+    // Collect business ids
+    const businessIds = businesses.map((b: any) => {
+      // b._id might be ObjectId or string; normalise to ObjectId
+      try {
+        return new mongoose.Types.ObjectId(b._id);
+      } catch (_) {
+        return b._id;
+      }
+    });
+
+    // Aggregate review stats for these businesses in one query
+    const stats = await Review.aggregate([
+      { $match: { businessId: { $in: businessIds } } },
+      {
+        $group: {
+          _id: "$businessId",
+          reviewCount: { $sum: 1 },
+          avgRating: { $avg: "$rating" },
+        },
+      },
+    ]).exec();
+
+    // Create map: businessIdStr -> stats
+    const statsMap = new Map<string, { reviewCount: number; avgRating: number }>();
+    for (const s of stats) {
+      const idStr = String(s._id);
+      statsMap.set(idStr, {
+        reviewCount: s.reviewCount ?? 0,
+        avgRating: typeof s.avgRating === "number" ? s.avgRating : 0,
+      });
+    }
+
+    // Attach aggregated stats to each business
+    const businessesWithStats = businesses.map((b: any) => {
+      const idStr = String(b._id ?? b.id);
+      const s = statsMap.get(idStr);
+      return {
+        ...b,
+        reviewCount: s ? s.reviewCount : 0,
+        avgRating: s ? Math.round((s.avgRating + Number.EPSILON) * 10) / 10 : 0, // one decimal
+      };
+    });
+
     return res.status(200).json({
       total,
       page,
       perPage: limit,
-      businesses,
+      businesses: businessesWithStats,
     });
   } catch (err) {
     console.error("GET /api/businesses error:", err);
@@ -409,6 +463,7 @@ router.get("/get-verified-businesses", async (req: Request, res: Response) => {
     return res.status(500).json({ message: "Unknown server error." });
   }
 });
+
 
 router.get("/services", async (req: Request, res: Response) => {
   try {
