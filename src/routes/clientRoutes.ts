@@ -968,7 +968,6 @@ router.post("/add-reviews", async (req: Request, res: Response) => {
   }
 });
 
-// GET /reviews?businessId=<id>&rating=5&page=1&limit=20&sort=newest
 router.get("/reviews", async (req: Request, res: Response) => {
   try {
     const { businessId, rating, page, limit, sort } = req.query ?? {};

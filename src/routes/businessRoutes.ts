@@ -1124,4 +1124,41 @@ router.get("/services/count", async (req: Request, res: Response) => {
   }
 });
 
+async function computeAndSendReviewStats(res: Response, businessId: string) {
+  try {
+    // use the static you added to the model if available
+    const stats = await (Review as any).computeStats(businessId);
+
+    const total = Number(stats.count ?? 0);
+    const avgRaw = Number(stats.avgRating ?? 0);
+    const avgRounded = total === 0 ? 0 : Number(avgRaw.toFixed(2));
+
+    const breakdown = {
+      "5": Number(stats.count5 ?? 0),
+      "4": Number(stats.count4 ?? 0),
+      "3": Number(stats.count3 ?? 0),
+      "2": Number(stats.count2 ?? 0),
+      "1": Number(stats.count1 ?? 0),
+    };
+
+    return res.json({
+      businessId,
+      avgRating: avgRounded,
+      totalReviews: total,
+      breakdown,
+    });
+  } catch (error) {
+    console.error("Failed to compute review stats:", error);
+    return res.status(500).json({ message: "Failed to compute review stats." });
+  }
+}
+
+router.get("/reviews/:businessId/stats", async (req: Request, res: Response) => {
+  const businessId = req.params.businessId;
+  if (!businessId) return res.status(400).json({ message: "businessId param is required." });
+  if (!mongoose.Types.ObjectId.isValid(businessId)) return res.status(400).json({ message: "Invalid businessId." });
+
+  return computeAndSendReviewStats(res, businessId);
+});
+
 export default router;
