@@ -442,9 +442,64 @@ router.get("/favorites", async (req: Request, res: Response) => {
       .lean()
       .exec();
 
+    // Gather unique businessIds (ObjectId) for ratings lookup
+    const businessIdSet = new Set<string>();
+    for (const f of favs) {
+      const b = f.businessId;
+      if (!b) {
+        // If business wasn't populated and is an id string/object, try to extract
+        const rawId = f.businessId;
+        if (rawId && mongoose.isValidObjectId(rawId)) businessIdSet.add(rawId.toString());
+        continue;
+      }
+      // b may be an object (populated) or an ObjectId/string
+      const idVal = b._id ?? b;
+      if (idVal && mongoose.isValidObjectId(idVal.toString())) businessIdSet.add(idVal.toString());
+    }
+
+    const businessIds = Array.from(businessIdSet).map((s) => new mongoose.Types.ObjectId(s));
+
+    // Fetch avg rating + counts per business in one aggregation
+    // Make sure Review is imported/available in this file
+    let ratingStatsMap: Record<string, { avgRating: number; count: number }> = {};
+    if (businessIds.length > 0) {
+      const stats = await Review.aggregate([
+        { $match: { businessId: { $in: businessIds } } },
+        {
+          $group: {
+            _id: "$businessId",
+            avgRating: { $avg: { $ifNull: ["$rating", 0] } },
+            count: { $sum: 1 },
+          },
+        },
+      ]).exec();
+
+      for (const s of stats) {
+        const key = s._id?.toString();
+        if (!key) continue;
+        ratingStatsMap[key] = {
+          avgRating: typeof s.avgRating === "number" ? Number(s.avgRating) : 0,
+          count: typeof s.count === "number" ? s.count : 0,
+        };
+      }
+    }
+
     // Normalize output: convert each favorite doc to a business object if populated
     const favoritesOut = favs.map((f: any) => {
       const business = f.businessId ?? null;
+
+      // Determine canonical business id string for looking up rating stats
+      let businessIdStr: string | null = null;
+      if (business) {
+        businessIdStr = (business._id ?? business).toString();
+      } else if (f.businessId) {
+        businessIdStr = f.businessId.toString();
+      }
+
+      const ratingEntry = businessIdStr ? ratingStatsMap[businessIdStr] : undefined;
+      const avgRating = ratingEntry?.count ? Number((ratingEntry.avgRating).toFixed(2)) : (ratingEntry ? Number(ratingEntry.avgRating.toFixed(2)) : null);
+      const ratingCount = ratingEntry?.count ?? 0;
+
       if (business) {
         // Normalize location (may be subdoc or undefined)
         const loc = business.location
@@ -471,13 +526,18 @@ router.get("/favorites", async (req: Request, res: Response) => {
           operatingSchedule: business.operatingSchedule ?? null,
           createdAt: business.createdAt ?? null,
           updatedAt: business.updatedAt ?? null,
+          avgRating: avgRating,      // NEW: average rating (rounded to 2 decimals) or null
+          ratingCount: ratingCount,  // NEW: number of reviews
           raw: business, // full populated business as fallback
         };
       }
-      // fallback: if no populated business, return the favorite doc minimal shape
+
+      // fallback: if no populated business, return the favorite doc minimal shape (with rating if available)
       return {
         favoriteId: f._id,
         businessId: f.businessId,
+        avgRating: avgRating,
+        ratingCount: ratingCount,
       };
     });
 
@@ -487,6 +547,7 @@ router.get("/favorites", async (req: Request, res: Response) => {
     return res.status(500).json({ message: "Server error.", error: err.message });
   }
 });
+
 
 // POST /add-favorite  (toggle behavior)
 router.post("/add-favorite", async (req: Request, res: Response) => {
